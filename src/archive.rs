@@ -1,27 +1,48 @@
-use std::cell::{Cell, RefCell};
-use std::cmp;
-use std::convert::TryFrom;
-use std::fs;
-use std::io::prelude::*;
-use std::io::{self, SeekFrom};
-use std::marker;
-use std::path::Path;
+use std::{cmp, marker, pin::Pin, sync::{Arc, Mutex}};
+use std::io::SeekFrom;
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs,
+    io::{self, Read, ReadExt, Seek},
+};
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs,
+    io::{self, AsyncRead as Read, AsyncReadExt, ReadBuf, AsyncSeek as Seek},
+};
 
-use crate::entry::{EntryFields, EntryIo};
-use crate::error::TarError;
-use crate::other;
-use crate::pax::*;
-use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
+use crate::{
+    entry::{EntryFields, EntryIo},
+    error::TarError,
+    other, Entry, GnuExtSparseHeader, GnuSparseHeader, Header,
+};
+use futures::{Stream, StreamExt};
+use pin_project::pin_project;
+use std::path::Path;
+use std::pin::pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{ready, Context, Poll};
+use crate::pax::{pax_extensions_value, PAX_GID, PAX_SIZE, PAX_UID};
 
 /// A top-level representation of an archive file.
 ///
 /// This archive can have an entry added to it and it can be iterated over.
-pub struct Archive<R: ?Sized + Read> {
-    inner: ArchiveInner<R>,
+#[derive(Debug)]
+pub struct Archive<R: Read + Unpin + ?Sized> {
+    inner: Arc<Mutex<ArchiveInner<R>>>,
 }
 
-pub struct ArchiveInner<R: ?Sized> {
-    pos: Cell<u64>,
+impl<R: Read + Unpin> Clone for Archive<R> {
+    fn clone(&self) -> Self {
+        Archive {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ArchiveInner<R: Read + Unpin + ?Sized> {
+    pos: AtomicU64,
     mask: u32,
     unpack_xattrs: bool,
     preserve_permissions: bool,
@@ -29,11 +50,13 @@ pub struct ArchiveInner<R: ?Sized> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
-    obj: RefCell<R>,
+    buf: Mutex<Vec<u8>>,
+    obj: Mutex<R>,
 }
 
 /// An iterator over the entries of an archive.
-pub struct Entries<'a, R: 'a + Read> {
+pub struct Entries<'a, R: 'a + Read + Unpin + Send> {
+    raw: bool,
     fields: EntriesFields<'a>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
@@ -41,47 +64,209 @@ pub struct Entries<'a, R: 'a + Read> {
 trait SeekRead: Read + Seek {}
 impl<R: Read + Seek> SeekRead for R {}
 
+#[pin_project]
 struct EntriesFields<'a> {
-    archive: &'a Archive<dyn Read + 'a>,
-    seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
+    archive: &'a Archive<dyn Read + Unpin + 'a>,
+    seekable_archive: Option<&'a Archive<dyn SeekRead + Unpin + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
+    #[pin]
+    fields: Option<EntryFields<'a>>,
+    gnu_longname: Option<Vec<u8>>,
+    gnu_longlink: Option<Vec<u8>>,
+    pax_extensions: Option<Vec<u8>>,
 }
 
-impl<R: Read> Archive<R> {
+/// Configure the archive.
+pub struct ArchiveBuilder<R: Read + Unpin> {
+    obj: R,
+    unpack_xattrs: bool,
+    preserve_permissions: bool,
+    preserve_ownerships: bool,
+    preserve_mtime: bool,
+    overwrite: bool,
+    ignore_zeros: bool,
+}
+
+impl<R: Read + Unpin> ArchiveBuilder<R> {
+    /// Create a new builder.
+    pub fn new(obj: R) -> Self {
+        ArchiveBuilder {
+            unpack_xattrs: false,
+            preserve_permissions: false,
+            preserve_ownerships: false,
+            preserve_mtime: true,
+            ignore_zeros: false,
+            overwrite: true,
+            obj,
+        }
+    }
+
+    /// Indicate whether extended file attributes (xattrs on Unix) are preserved
+    /// when unpacking this archive.
+    ///
+    /// This flag is disabled by default and is currently only implemented on
+    /// Unix using xattr support. This may eventually be implemented for
+    /// Windows, however, if other archive implementations are found which do
+    /// this as well.
+    pub fn set_unpack_xattrs(mut self, unpack_xattrs: bool) -> Self {
+        self.unpack_xattrs = unpack_xattrs;
+        self
+    }
+
+    /// Indicate whether extended permissions (like suid on Unix) are preserved
+    /// when unpacking this entry.
+    ///
+    /// This flag is disabled by default and is currently only implemented on
+    /// Unix.
+    pub fn set_preserve_permissions(mut self, preserve: bool) -> Self {
+        self.preserve_permissions = preserve;
+        self
+    }
+
+    /// Indicate whether numeric ownership ids (like uid and gid on Unix)
+    /// are preserved when unpacking this entry.
+    ///
+    /// This flag is disabled by default and is currently only implemented on
+    /// Unix.
+    pub fn set_preserve_ownerships(mut self, preserve: bool) -> Self {
+        self.preserve_ownerships = preserve;
+        self
+    }
+
+    /// Indicate whether access time information is preserved when unpacking
+    /// this entry.
+    ///
+    /// This flag is enabled by default.
+    pub fn set_preserve_mtime(mut self, preserve: bool) -> Self {
+        self.preserve_mtime = preserve;
+        self
+    }
+
+    /// Ignore zeroed headers, which would otherwise indicate to the archive that it has no more
+    /// entries.
+    ///
+    /// This can be used in case multiple tar archives have been concatenated together.
+    pub fn set_ignore_zeros(mut self, ignore_zeros: bool) -> Self {
+        self.ignore_zeros = ignore_zeros;
+        self
+    }
+
+    /// Construct the archive, ready to accept inputs.
+    pub fn build(self) -> Archive<R> {
+        let Self {
+            unpack_xattrs,
+            preserve_permissions,
+            preserve_ownerships,
+            preserve_mtime,
+            ignore_zeros,
+            overwrite,
+            obj,
+        } = self;
+
+        Archive {
+            inner: Arc::new(Mutex::new(ArchiveInner {
+                mask: u32::MIN,
+                unpack_xattrs,
+                preserve_permissions,
+                preserve_ownerships,
+                preserve_mtime,
+                ignore_zeros,
+                overwrite,
+                obj: Mutex::new(obj),
+                buf: Mutex::new(Vec::new()),
+                pos: AtomicU64::new(0),
+            })),
+        }
+    }
+}
+
+impl<R: Read + Unpin + Send> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
-            inner: ArchiveInner {
+            inner: Arc::new(Mutex::new(ArchiveInner {
                 mask: u32::MIN,
                 unpack_xattrs: false,
                 preserve_permissions: false,
                 preserve_ownerships: false,
                 preserve_mtime: true,
-                overwrite: true,
                 ignore_zeros: false,
-                obj: RefCell::new(obj),
-                pos: Cell::new(0),
-            },
+                overwrite: true,
+                obj: Mutex::new(obj),
+                buf: Mutex::new(Vec::new()),
+                pos: AtomicU64::new(0),
+            })),
         }
     }
 
     /// Unwrap this archive, returning the underlying object.
-    pub fn into_inner(self) -> R {
-        self.inner.obj.into_inner()
+    pub fn into_inner(self) -> Result<R, Self> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => Ok(inner.into_inner().unwrap().obj),
+            Err(inner) => Err(Self { inner }),
+        }
     }
 
-    /// Construct an iterator over the entries in this archive.
+    /// Construct a stream over the entries in this archive.
     ///
     /// Note that care must be taken to consider each entry within an archive in
     /// sequence. If entries are processed out of sequence (from what the
-    /// iterator returns), then the contents read for each entry may be
+    /// stream returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
-        let me: &mut Archive<dyn Read> = self;
-        me._entries(None).map(|fields| Entries {
-            fields: fields,
+        if self.inner.lock().unwrap().pos.load(Ordering::SeqCst) != 0 {
+            return Err(other(
+                "cannot call entries unless archive is at \
+                 position 0",
+            ));
+        }
+
+        Ok(Entries {
+            raw: false,
+            fields: EntriesFields {
+                archive: self,
+                seekable_archive: None,
+                done: false,
+                next: 0,
+                raw: false,
+                fields: None,
+                gnu_longname: None,
+                gnu_longlink: None,
+                pax_extensions: None,
+            },
+            _ignored: marker::PhantomData,
+        })
+    }
+
+    /// Construct a stream over the raw entries in this archive.
+    ///
+    /// Note that care must be taken to consider each entry within an archive in
+    /// sequence. If entries are processed out of sequence (from what the
+    /// stream returns), then the contents read for each entry may be
+    /// corrupted.
+    pub fn entries_raw(&mut self) -> io::Result<Entries<R>> {
+        if self.inner.lock().unwrap().pos.load(Ordering::SeqCst) != 0 {
+            return Err(other(
+                "cannot call entries_raw unless archive is at \
+                 position 0",
+            ));
+        }
+
+        Ok(Entries {
+            raw: true,
+            fields: EntriesFields {
+                archive: self,
+                seekable_archive: None,
+                done: false,
+                next: 0,
+                raw: false,
+                fields: None,
+                gnu_longname: None,
+                gnu_longlink: None,
+                pax_extensions: None,
+            },
             _ignored: marker::PhantomData,
         })
     }
@@ -99,124 +284,26 @@ impl<R: Read> Archive<R> {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::fs::File;
-    /// use tar::Archive;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    /// #
+    /// use tokio::fs::File;
+    /// use async_tar_rs::Archive;
     ///
-    /// let mut ar = Archive::new(File::open("foo.tar").unwrap());
-    /// ar.unpack("foo").unwrap();
+    /// let mut ar = Archive::new(File::open("foo.tar").await?);
+    /// ar.unpack("foo").await?;
+    /// #
+    /// # Ok(()) }
     /// ```
-    pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        let me: &mut Archive<dyn Read> = self;
-        me._unpack(dst.as_ref())
-    }
+    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
+        let mut entries = self.entries()?;
+        let mut pinned = Pin::new(&mut entries);
+        let dst = dst.as_ref();
 
-    /// Set the mask of the permission bits when unpacking this entry.
-    ///
-    /// The mask will be inverted when applying against a mode, similar to how
-    /// `umask` works on Unix. In logical notation it looks like:
-    ///
-    /// ```text
-    /// new_mode = old_mode & (~mask)
-    /// ```
-    ///
-    /// The mask is 0 by default and is currently only implemented on Unix.
-    pub fn set_mask(&mut self, mask: u32) {
-        self.inner.mask = mask;
-    }
-
-    /// Indicate whether extended file attributes (xattrs on Unix) are preserved
-    /// when unpacking this archive.
-    ///
-    /// This flag is disabled by default and is currently only implemented on
-    /// Unix using xattr support. This may eventually be implemented for
-    /// Windows, however, if other archive implementations are found which do
-    /// this as well.
-    pub fn set_unpack_xattrs(&mut self, unpack_xattrs: bool) {
-        self.inner.unpack_xattrs = unpack_xattrs;
-    }
-
-    /// Indicate whether extended permissions (like suid on Unix) are preserved
-    /// when unpacking this entry.
-    ///
-    /// This flag is disabled by default and is currently only implemented on
-    /// Unix.
-    pub fn set_preserve_permissions(&mut self, preserve: bool) {
-        self.inner.preserve_permissions = preserve;
-    }
-
-    /// Indicate whether numeric ownership ids (like uid and gid on Unix)
-    /// are preserved when unpacking this entry.
-    ///
-    /// This flag is disabled by default and is currently only implemented on
-    /// Unix.
-    pub fn set_preserve_ownerships(&mut self, preserve: bool) {
-        self.inner.preserve_ownerships = preserve;
-    }
-
-    /// Indicate whether files and symlinks should be overwritten on extraction.
-    pub fn set_overwrite(&mut self, overwrite: bool) {
-        self.inner.overwrite = overwrite;
-    }
-
-    /// Indicate whether access time information is preserved when unpacking
-    /// this entry.
-    ///
-    /// This flag is enabled by default.
-    pub fn set_preserve_mtime(&mut self, preserve: bool) {
-        self.inner.preserve_mtime = preserve;
-    }
-
-    /// Ignore zeroed headers, which would otherwise indicate to the archive that it has no more
-    /// entries.
-    ///
-    /// This can be used in case multiple tar archives have been concatenated together.
-    pub fn set_ignore_zeros(&mut self, ignore_zeros: bool) {
-        self.inner.ignore_zeros = ignore_zeros;
-    }
-}
-
-impl<R: Seek + Read> Archive<R> {
-    /// Construct an iterator over the entries in this archive for a seekable
-    /// reader. Seek will be used to efficiently skip over file contents.
-    ///
-    /// Note that care must be taken to consider each entry within an archive in
-    /// sequence. If entries are processed out of sequence (from what the
-    /// iterator returns), then the contents read for each entry may be
-    /// corrupted.
-    pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
-        let me: &Archive<dyn Read> = self;
-        let me_seekable: &Archive<dyn SeekRead> = self;
-        me._entries(Some(me_seekable)).map(|fields| Entries {
-            fields: fields,
-            _ignored: marker::PhantomData,
-        })
-    }
-}
-
-impl Archive<dyn Read + '_> {
-    fn _entries<'a>(
-        &'a self,
-        seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
-    ) -> io::Result<EntriesFields<'a>> {
-        if self.inner.pos.get() != 0 {
-            return Err(other(
-                "cannot call entries unless archive is at \
-                 position 0",
-            ));
-        }
-        Ok(EntriesFields {
-            archive: self,
-            seekable_archive,
-            done: false,
-            next: 0,
-            raw: false,
-        })
-    }
-
-    fn _unpack(&mut self, dst: &Path) -> io::Result<()> {
         if dst.symlink_metadata().is_err() {
             fs::create_dir_all(&dst)
-                .map_err(|e| TarError::new(format!("failed to create `{}`", dst.display()), e))?;
+                .await
+                .map_err(|e| TarError::new(&format!("failed to create `{}`", dst.display()), e))?;
         }
 
         // Canonicalizing the dst directory will prepend the path with '\\?\'
@@ -224,18 +311,18 @@ impl Archive<dyn Read + '_> {
         // extended-length path with a 32,767 character limit. Otherwise all
         // unpacked paths over 260 characters will fail on creation with a
         // NotFound exception.
-        let dst = &dst.canonicalize().unwrap_or(dst.to_path_buf());
+        let dst = &dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf());
 
         // Delay any directory entries until the end (they will be created if needed by
         // descendants), to ensure that directory permissions do not interfer with descendant
         // extraction.
         let mut directories = Vec::new();
-        for entry in self._entries(None)? {
+        while let Some(entry) = pinned.next().await {
             let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
             if file.header().entry_type() == crate::EntryType::Directory {
                 directories.push(file);
             } else {
-                file.unpack_in(dst)?;
+                file.unpack_in(dst).await?;
             }
         }
 
@@ -248,54 +335,61 @@ impl Archive<dyn Read + '_> {
         // [0]: <https://github.com/alexcrichton/tar-rs/issues/242>
         directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
         for mut dir in directories {
-            dir.unpack_in(dst)?;
+            dir.unpack_in(dst).await?;
         }
 
         Ok(())
     }
 }
 
-impl<'a, R: Read> Entries<'a, R> {
-    /// Indicates whether this iterator will return raw entries or not.
-    ///
-    /// If the raw list of entries are returned, then no preprocessing happens
-    /// on account of this library, for example taking into account GNU long name
-    /// or long link archive members. Raw iteration is disabled by default.
-    pub fn raw(self, raw: bool) -> Entries<'a, R> {
-        Entries {
-            fields: EntriesFields {
-                raw: raw,
-                ..self.fields
-            },
-            _ignored: marker::PhantomData,
+macro_rules! ready_opt_err {
+    ($val:expr) => {
+        match ::std::task::ready!($val) {
+            Some(Ok(val)) => val,
+            Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+            None => return Poll::Ready(None),
         }
-    }
+    };
 }
-impl<'a, R: Read> Iterator for Entries<'a, R> {
-    type Item = io::Result<Entry<'a, R>>;
 
-    fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
-        self.fields
-            .next()
-            .map(|result| result.map(|e| EntryFields::from(e).into_entry()))
+macro_rules! ready_err {
+    ($val:expr) => {
+        match ::std::task::ready!($val) {
+            Ok(val) => val,
+            Err(err) => return Poll::Ready(Some(Err(err))),
+        }
+    };
+}
+
+impl<'a, R: Read + Send + Unpin> Stream for Entries<'a, R> {
+    type Item = io::Result<Entry<'a, Archive<R>>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(
+            futures::ready!(Pin::new(&mut self.fields).poll_next(cx))
+                .map(|result| result.map(|e| EntryFields::from(e).into_entry())),
+        )
     }
 }
 
 impl<'a> EntriesFields<'a> {
-    fn next_entry_raw(
+    fn poll_next_entry_raw(
         &mut self,
         pax_extensions: Option<&[u8]>,
-    ) -> io::Result<Option<Entry<'a, io::Empty>>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Entry<'a, io::Empty>>>> {
         let mut header = Header::new_old();
         let mut header_pos = self.next;
         loop {
             // Seek to the start of the next header in the archive
-            let delta = self.next - self.archive.inner.pos.get();
-            self.skip(delta)?;
+            let delta = self.next - self.archive.inner.pos.load(Ordering::SeqCst);
+            futures::ready!(self.poll_skip(delta, cx))?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !try_read_all(&mut &self.archive.inner, header.as_mut_bytes())? {
-                return Ok(None);
+            if !futures::ready!(
+                pin!(&self.archive.inner).poll_try_read_all(cx, header.as_mut_bytes())
+            )? {
+                return Poll::Ready(Ok(None));
             }
 
             // If a header is not all zeros, we have another valid header.
@@ -307,7 +401,7 @@ impl<'a> EntriesFields<'a> {
             }
 
             if !self.archive.inner.ignore_zeros {
-                return Ok(None);
+                return Poll::Ready(Ok(None));
             }
             self.next += 512;
             header_pos = self.next;
@@ -321,7 +415,7 @@ impl<'a> EntriesFields<'a> {
             + 8 * 32;
         let cksum = header.cksum()?;
         if sum != cksum {
-            return Err(other("archive header checksum mismatch"));
+            return Poll::Ready(Err(other("archive header checksum mismatch")));
         }
 
         let mut pax_size: Option<u64> = None;
@@ -345,11 +439,11 @@ impl<'a> EntriesFields<'a> {
             }
         }
         let ret = EntryFields {
-            size: size,
-            header_pos: header_pos,
-            file_pos: file_pos,
+            size,
+            header_pos,
+            file_pos,
             data: vec![EntryIo::Data((&self.archive.inner).take(size))],
-            header: header,
+            header,
             long_pathname: None,
             long_linkname: None,
             pax_extensions: None,
@@ -359,6 +453,7 @@ impl<'a> EntriesFields<'a> {
             preserve_mtime: self.archive.inner.preserve_mtime,
             overwrite: self.archive.inner.overwrite,
             preserve_ownerships: self.archive.inner.preserve_ownerships,
+            read_state: None,
         };
 
         // Store where the next entry is, rounding up by 512 bytes (the size of
@@ -371,83 +466,108 @@ impl<'a> EntriesFields<'a> {
             .checked_add(size & !(512 - 1))
             .ok_or_else(|| other("size overflow"))?;
 
-        Ok(Some(ret.into_entry()))
+        Poll::Ready(Ok(Some(ret.into_entry())))
     }
 
-    fn next_entry(&mut self) -> io::Result<Option<Entry<'a, io::Empty>>> {
+    fn poll_next_entry(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Entry<io::Empty>>>> {
         if self.raw {
-            return self.next_entry_raw(None);
+            return self.poll_next_entry_raw(None, cx);
         }
 
-        let mut gnu_longname = None;
-        let mut gnu_longlink = None;
-        let mut pax_extensions = None;
         let mut processed = 0;
         loop {
-            processed += 1;
-            let entry = match self.next_entry_raw(pax_extensions.as_deref())? {
-                Some(entry) => entry,
-                None if processed > 1 => {
-                    return Err(other(
-                        "members found describing a future member \
-                         but no future member found",
-                    ));
-                }
-                None => return Ok(None),
+            let fields = if let Some(fields) = self.fields.as_mut() {
+                fields
+            } else {
+                processed += 1;
+                let pax_extensions = self.pax_extensions.clone();
+                self.fields = match futures::ready!(
+                    self.poll_next_entry_raw(pax_extensions.as_deref(), cx)
+                )? {
+                    Some(entry) => Some(EntryFields::from(entry)),
+                    None if processed > 1 => {
+                        return Poll::Ready(Err(other(
+                            "members found describing a future member but no future member found",
+                        )));
+                    }
+                    None => return Poll::Ready(Ok(None)),
+                };
+                continue;
             };
 
             let is_recognized_header =
-                entry.header().as_gnu().is_some() || entry.header().as_ustar().is_some();
+                fields.header.as_gnu().is_some() || fields.header.as_ustar().is_some();
 
-            if is_recognized_header && entry.header().entry_type().is_gnu_longname() {
-                if gnu_longname.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_gnu_longname() {
+                if fields.long_pathname.is_some() {
+                    return Poll::Ready(Err(other(
                         "two long name entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                gnu_longname = Some(EntryFields::from(entry).read_all()?);
+
+                self.gnu_longname = Some(futures::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_gnu_longlink() {
-                if gnu_longlink.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_gnu_longlink() {
+                if fields.long_linkname.is_some() {
+                    return Poll::Ready(Err(other(
                         "two long name entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                gnu_longlink = Some(EntryFields::from(entry).read_all()?);
+
+                self.gnu_longlink = Some(futures::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_pax_local_extensions() {
-                if pax_extensions.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_pax_local_extensions() {
+                if fields.pax_extensions.is_some() {
+                    return Poll::Ready(Err(other(
                         "two pax extensions entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                pax_extensions = Some(EntryFields::from(entry).read_all()?);
+
+                self.pax_extensions =
+                    Some(futures::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            let mut fields = EntryFields::from(entry);
-            fields.long_pathname = gnu_longname;
-            fields.long_linkname = gnu_longlink;
-            fields.pax_extensions = pax_extensions;
-            self.parse_sparse_header(&mut fields)?;
-            return Ok(Some(fields.into_entry()));
+            futures::ready!(Self::poll_parse_sparse_header(
+                &mut self.next,
+                self.archive,
+                fields,
+                cx
+            ))?;
+
+            fields.long_pathname = self.gnu_longname.take();
+            fields.long_linkname = self.gnu_longlink.take();
+            fields.pax_extensions = self.pax_extensions.take();
+
+            return Poll::Ready(Ok(Some(self.fields.take().unwrap().into_entry())));
         }
     }
 
-    fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a>) -> io::Result<()> {
+    fn poll_parse_sparse_header(
+        next: &mut u64,
+        archive: &'a Archive<dyn Read + Send + Unpin + 'a>,
+        entry: &mut EntryFields<'a>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         if !entry.header.entry_type().is_gnu_sparse() {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
         let gnu = match entry.header.as_gnu() {
             Some(gnu) => gnu,
-            None => return Err(other("sparse entry type listed but not GNU header")),
+            None => return Poll::Ready(Err(other("sparse entry type listed but not GNU header"))),
         };
 
         // Sparse files are represented internally as a list of blocks that are
@@ -475,7 +595,7 @@ impl<'a> EntriesFields<'a> {
         let mut remaining = entry.size;
         {
             let data = &mut entry.data;
-            let reader = &self.archive.inner;
+            let reader = &archive.inner;
             let size = entry.size;
             let mut add_block = |block: &GnuSparseHeader| -> io::Result<_> {
                 if block.is_empty() {
@@ -516,11 +636,13 @@ impl<'a> EntriesFields<'a> {
                 let mut ext = GnuExtSparseHeader::new();
                 ext.isextended[0] = 1;
                 while ext.is_extended() {
-                    if !try_read_all(&mut &self.archive.inner, ext.as_mut_bytes())? {
-                        return Err(other("failed to read extension"));
+                    if !futures::ready!(
+                        pin!(&archive.inner).poll_try_read_all(cx, ext.as_mut_bytes())
+                    )? {
+                        return Poll::Ready(Err(other("failed to read extension")));
                     }
 
-                    self.next += 512;
+                    *next += 512;
                     for block in ext.sparse.iter() {
                         add_block(block)?;
                     }
@@ -528,97 +650,251 @@ impl<'a> EntriesFields<'a> {
             }
         }
         if cur != gnu.real_size()? {
-            return Err(other(
+            return Poll::Ready(Err(other(
                 "mismatch in sparse file chunks and \
                  size in header",
-            ));
+            )));
         }
         entry.size = cur;
         if remaining > 0 {
-            return Err(other(
+            return Poll::Ready(Err(other(
                 "mismatch in sparse file chunks and \
                  entry size in header",
-            ));
+            )));
         }
-        Ok(())
+
+        Poll::Ready(Ok(()))
     }
 
-    fn skip(&mut self, mut amt: u64) -> io::Result<()> {
+    fn poll_skip(&mut self, amt: u64, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         if let Some(seekable_archive) = self.seekable_archive {
-            let pos = io::SeekFrom::Current(
+            #[cfg(feature = "tokio")]
+            let _ = futures::ready!(pin!(&seekable_archive.inner).poll_complete(cx));
+            let pos = SeekFrom::Current(
                 i64::try_from(amt).map_err(|_| other("seek position out of bounds"))?,
             );
-            (&seekable_archive.inner).seek(pos)?;
-        } else {
-            let mut buf = [0u8; 4096 * 8];
-            while amt > 0 {
-                let n = cmp::min(amt, buf.len() as u64);
-                let n = (&self.archive.inner).read(&mut buf[..n as usize])?;
-                if n == 0 {
-                    return Err(other("unexpected EOF during skip"));
-                }
-                amt -= n as u64;
+
+            #[cfg(feature = "tokio")]
+            match pin!(&seekable_archive.inner).start_seek(pos) {
+                Ok(_) => pin!(&seekable_archive.inner).poll_complete(cx),
+                Err(e) => Poll::Ready(Err(e)),
             }
+
+            #[cfg(feature = "async-std")]
+            pin!(&seekable_archive.inner).poll_seek(cx, pos)
+        } else {
+            let mut rem = amt;
+            let mut buf = [0u8; 4096 * 8];
+            while rem > 0 {
+                let n = cmp::min(amt, buf.len() as u64);
+                #[cfg(feature = "tokio")]
+                {
+                    let mut buf = ReadBuf::new(&mut buf[..n as usize]);
+                    match futures::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
+                        Ok(_) => {
+                            let n = buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Err(other("unexpected EOF during skip")));
+                            }
+                            rem -= n as u64;
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+
+                #[cfg(feature = "async-std")]
+                {
+                    let mut buf = &mut buf[..n as usize];
+                    match futures::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
+                        Ok(n) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(other("unexpected EOF during skip")));
+                            }
+
+                            rem -= n as u64;
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+            }
+
+            Poll::Ready(Ok(amt))
         }
-        Ok(())
     }
 }
 
-impl<'a> Iterator for EntriesFields<'a> {
+impl<'a> Stream for EntriesFields<'a> {
     type Item = io::Result<Entry<'a, io::Empty>>;
 
-    fn next(&mut self) -> Option<io::Result<Entry<'a, io::Empty>>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.done {
-            None
+            Poll::Ready(None)
         } else {
-            match self.next_entry() {
-                Ok(Some(e)) => Some(Ok(e)),
+            match futures::ready!(self.poll_next_entry(cx)) {
+                Ok(Some(e)) => Poll::Ready(Some(Ok(e))),
                 Ok(None) => {
                     self.done = true;
-                    None
+                    Poll::Ready(None)
                 }
                 Err(e) => {
                     self.done = true;
-                    Some(Err(e))
+                    Poll::Ready(Some(Err(e)))
                 }
             }
         }
     }
 }
 
-impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        let i = self.obj.borrow_mut().read(into)?;
-        self.pos.set(self.pos.get() + i as u64);
-        Ok(i)
-    }
-}
 
-impl<'a, R: ?Sized + Seek> Seek for &'a ArchiveInner<R> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let pos = self.obj.borrow_mut().seek(pos)?;
-        self.pos.set(pos);
-        Ok(pos)
+impl<R: Read + Unpin> Read for Archive<R> {
+    #[cfg(feature = "async-std")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        into: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut lock = self.inner.lock().unwrap();
+        let mut inner = Pin::new(&mut *lock);
+        let r = Pin::new(&mut inner.obj);
+
+        let res = ready!(r.poll_read(cx, into));
+        match res {
+            Ok(i) => {
+                inner.pos += i as u64;
+                Poll::Ready(Ok(i))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut lock = self.inner.lock().unwrap();
+        let mut inner = Pin::new(&mut *lock);
+        let r = Pin::new(&mut inner.obj);
+
+        let res = ready!(r.poll_read(cx, buf));
+        match res {
+            Ok(()) => {
+                inner.pos += buf.filled().len() as u64;
+                Poll::Ready(Ok(()))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
     }
 }
 
 /// Try to fill the buffer from the reader.
 ///
 /// If the reader reaches its end before filling the buffer at all, returns `false`.
-/// Otherwise returns `true`.
-fn try_read_all<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
-    let mut read = 0;
-    while read < buf.len() {
-        match r.read(&mut buf[read..])? {
-            0 => {
-                if read == 0 {
-                    return Ok(false);
-                }
+/// Otherwise, returns `true`.
+fn poll_try_read_all<R: Read + Unpin>(
+    mut source: R,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+    pos: &mut usize,
+) -> Poll<io::Result<bool>> {
+    #[cfg(feature = "async-std")]
+    {
+        while *pos < buf.len() {
+            match ready!(Pin::new(&mut source).poll_read(cx, &mut buf[*pos..])) {
+                Ok(0) => {
+                    if *pos == 0 {
+                        return Poll::Ready(Ok(false));
+                    }
 
-                return Err(other("failed to read entire block"));
+                    return Poll::Ready(Err(other("failed to read entire block")));
+                }
+                Ok(n) => *pos += n,
+                Err(err) => return Poll::Ready(Err(err)),
             }
-            n => read += n,
         }
     }
-    Ok(true)
+
+    #[cfg(feature = "tokio")]
+    {
+        let mut read_buf = ReadBuf::new(buf);
+        read_buf.set_filled(*pos);
+
+        while read_buf.remaining() > 0 {
+            match ready!(Pin::new(&mut source).poll_read(cx, &mut read_buf)) {
+                Ok(()) => {
+                    let len = read_buf.filled().len();
+                    if len == 0 {
+                        if *pos == 0 {
+                            return Poll::Ready(Ok(false));
+                        }
+
+                        return Poll::Ready(Err(other("failed to read entire block")));
+                    } else {
+                        *pos += len;
+                    }
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+
+    *pos = 0;
+    Poll::Ready(Ok(true))
+}
+
+/// Skip n bytes on the given source.
+fn poll_skip<R: Read + Unpin>(
+    mut source: R,
+    cx: &mut Context<'_>,
+    mut amt: u64,
+) -> Poll<io::Result<()>> {
+    let mut buf = [0u8; 4096 * 8];
+    while amt > 0 {
+        let n = cmp::min(amt, buf.len() as u64);
+
+        #[cfg(feature = "async-std")]
+        {
+            match ready!(Pin::new(&mut source).poll_read(cx, &mut buf[..n as usize])) {
+                Ok(0) => {
+                    return Poll::Ready(Err(other("unexpected EOF during skip")));
+                }
+                Ok(n) => {
+                    amt -= n as u64;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        {
+            let start_pos = buf.len() - n as usize;
+            let mut read_buf = ReadBuf::new(&mut buf);
+            read_buf.set_filled(start_pos);
+
+            match ready!(Pin::new(&mut source).poll_read(cx, &mut read_buf)) {
+                Ok(()) => {
+                    let len = read_buf.filled().len() - start_pos;
+                    if len == 0 {
+                        return Poll::Ready(Err(other("unexpected EOF during skip")));
+                    } else {
+                        amt -= len as u64;
+                    }
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+
+    Poll::Ready(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    assert_impl_all!(fs::File: Send, Sync);
+    assert_impl_all!(Entries<fs::File>: Send, Sync);
+    assert_impl_all!(Archive<fs::File>: Send, Sync);
+    assert_impl_all!(Entry<Archive<fs::File>>: Send, Sync);
 }

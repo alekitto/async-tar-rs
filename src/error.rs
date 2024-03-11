@@ -1,18 +1,20 @@
-use std::borrow::Cow;
-use std::error;
-use std::fmt;
-use std::io::{self, Error};
+use std::{error, fmt};
+
+#[cfg(feature = "async-std")]
+use async_std::io::Error;
+#[cfg(feature = "tokio")]
+use tokio::io::Error;
 
 #[derive(Debug)]
 pub struct TarError {
-    desc: Cow<'static, str>,
-    io: io::Error,
+    desc: String,
+    io: Error,
 }
 
 impl TarError {
-    pub fn new(desc: impl Into<Cow<'static, str>>, err: Error) -> TarError {
+    pub fn new(desc: &str, err: Error) -> TarError {
         TarError {
-            desc: desc.into(),
+            desc: desc.to_string(),
             io: err,
         }
     }

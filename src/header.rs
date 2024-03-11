@@ -1,20 +1,17 @@
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "redox"))]
 use std::os::unix::prelude::*;
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 
-use std::borrow::Cow;
-use std::fmt;
-use std::fs;
-use std::io;
-use std::iter;
-use std::iter::{once, repeat};
-use std::mem;
-use std::path::{Component, Path, PathBuf};
-use std::str;
+#[cfg(feature = "async-std")]
+use async_std::io;
+use std::iter::once;
+use std::{borrow::Cow, fmt, fs::Metadata, iter, iter::repeat, mem, str};
+#[cfg(feature = "tokio")]
+use tokio::io;
 
-use crate::other;
-use crate::EntryType;
+use crate::{other, EntryType};
+use std::path::{Component, Path, PathBuf};
 
 /// A deterministic, arbitrary, non-zero timestamp that use used as `mtime`
 /// of headers when [`HeaderMode::Deterministic`] is used.
@@ -138,6 +135,7 @@ pub struct GnuSparseHeader {
 /// the next entry will be one of these headers.
 #[repr(C)]
 #[allow(missing_docs)]
+#[derive(Debug)]
 pub struct GnuExtSparseHeader {
     pub sparse: [GnuSparseHeader; GNU_EXT_SPARSE_HEADERS_COUNT],
     pub isextended: [u8; 1],
@@ -291,13 +289,13 @@ impl Header {
     /// This is useful for initializing a `Header` from the OS's metadata from a
     /// file. By default, this will use `HeaderMode::Complete` to include all
     /// metadata.
-    pub fn set_metadata(&mut self, meta: &fs::Metadata) {
+    pub fn set_metadata(&mut self, meta: &Metadata) {
         self.fill_from(meta, HeaderMode::Complete);
     }
 
     /// Sets only the metadata relevant to the given HeaderMode in this header
     /// from the metadata argument provided.
-    pub fn set_metadata_in_mode(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    pub fn set_metadata_in_mode(&mut self, meta: &Metadata, mode: HeaderMode) {
         self.fill_from(meta, mode);
     }
 
@@ -325,7 +323,7 @@ impl Header {
         if self.entry_type().is_gnu_sparse() {
             self.as_gnu()
                 .ok_or_else(|| other("sparse header was not a gnu header"))
-                .and_then(|h| h.real_size())
+                .and_then(GnuHeader::real_size)
         } else {
             self.entry_size()
         }
@@ -372,13 +370,7 @@ impl Header {
     ///
     /// This function will set the pathname listed in this header, encoding it
     /// in the appropriate format. May fail if the path is too long or if the
-    /// path specified is not Unicode and this is a Windows platform. Will
-    /// strip out any "." path component, which signifies the current directory.
-    ///
-    /// Note: This function does not support names over 100 bytes, or paths
-    /// over 255 bytes, even for formats that support longer names. Instead,
-    /// use `Builder` methods to insert a long-name extension at the same time
-    /// as the file content.
+    /// path specified is not Unicode and this is a Windows platform.
     pub fn set_path<P: AsRef<Path>>(&mut self, p: P) -> io::Result<()> {
         self._set_path(p.as_ref())
     }
@@ -419,10 +411,10 @@ impl Header {
     /// separators.
     pub fn link_name_bytes(&self) -> Option<Cow<[u8]>> {
         let old = self.as_old();
-        if old.linkname[0] != 0 {
-            Some(Cow::Borrowed(truncate(&old.linkname)))
-        } else {
+        if old.linkname[0] == 0 {
             None
+        } else {
+            Some(Cow::Borrowed(truncate(&old.linkname)))
         }
     }
 
@@ -430,10 +422,7 @@ impl Header {
     ///
     /// This function will set the linkname listed in this header, encoding it
     /// in the appropriate format. May fail if the link name is too long or if
-    /// the path specified is not Unicode and this is a Windows platform. Will
-    /// strip out any "." path component, which signifies the current directory.
-    ///
-    /// To use GNU long link names, prefer instead [`crate::Builder::append_link`].
+    /// the path specified is not Unicode and this is a Windows platform.
     pub fn set_link_name<P: AsRef<Path>>(&mut self, p: P) -> io::Result<()> {
         self._set_link_name(p.as_ref())
     }
@@ -482,14 +471,12 @@ impl Header {
     ///
     /// May return an error if the field is corrupted.
     pub fn uid(&self) -> io::Result<u64> {
-        num_field_wrapper_from(&self.as_old().uid)
-            .map(|u| u as u64)
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("{} when getting uid for {}", err, self.path_lossy()),
-                )
-            })
+        num_field_wrapper_from(&self.as_old().uid).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("{} when getting uid for {}", err, self.path_lossy()),
+            )
+        })
     }
 
     /// Encodes the `uid` provided into this header.
@@ -499,14 +486,12 @@ impl Header {
 
     /// Returns the value of the group's user ID field
     pub fn gid(&self) -> io::Result<u64> {
-        num_field_wrapper_from(&self.as_old().gid)
-            .map(|u| u as u64)
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("{} when getting gid for {}", err, self.path_lossy()),
-                )
-            })
+        num_field_wrapper_from(&self.as_old().gid).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("{} when getting gid for {}", err, self.path_lossy()),
+            )
+        })
     }
 
     /// Encodes the `gid` provided into this header.
@@ -726,7 +711,7 @@ impl Header {
             .fold(0, |a, b| a + (*b as u32))
     }
 
-    fn fill_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_from(&mut self, meta: &Metadata, mode: HeaderMode) {
         self.fill_platform_from(meta, mode);
         // Set size of directories to zero
         self.set_size(if meta.is_dir() || meta.file_type().is_symlink() {
@@ -746,18 +731,18 @@ impl Header {
 
     #[cfg(target_arch = "wasm32")]
     #[allow(unused_variables)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_platform_from(&mut self, meta: &Metadata, mode: HeaderMode) {
         unimplemented!();
     }
 
-    #[cfg(unix)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    #[cfg(any(unix, target_os = "redox"))]
+    fn fill_platform_from(&mut self, meta: &Metadata, mode: HeaderMode) {
         match mode {
             HeaderMode::Complete => {
                 self.set_mtime(meta.mtime() as u64);
                 self.set_uid(meta.uid() as u64);
                 self.set_gid(meta.gid() as u64);
-                self.set_mode(meta.mode() as u32);
+                self.set_mode(meta.mode());
             }
             HeaderMode::Deterministic => {
                 // We could in theory set the mtime to zero here, but not all tools seem to behave
@@ -765,7 +750,6 @@ impl Header {
                 // For example, rust-lang/cargo#9512 shows that lldb doesn't ingest files with a
                 // zero timestamp correctly.
                 self.set_mtime(DETERMINISTIC_TIMESTAMP);
-
                 self.set_uid(0);
                 self.set_gid(0);
 
@@ -791,6 +775,7 @@ impl Header {
         // TODO: need to bind more file types
         self.set_entry_type(entry_type(meta.mode()));
 
+        #[cfg(not(target_os = "redox"))]
         fn entry_type(mode: u32) -> EntryType {
             match mode as libc::mode_t & libc::S_IFMT {
                 libc::S_IFREG => EntryType::file(),
@@ -799,6 +784,17 @@ impl Header {
                 libc::S_IFBLK => EntryType::block_special(),
                 libc::S_IFDIR => EntryType::dir(),
                 libc::S_IFIFO => EntryType::fifo(),
+                _ => EntryType::new(b' '),
+            }
+        }
+
+        #[cfg(target_os = "redox")]
+        fn entry_type(mode: u32) -> EntryType {
+            use syscall;
+            match mode as u16 & syscall::MODE_TYPE {
+                syscall::MODE_FILE => EntryType::file(),
+                syscall::MODE_SYMLINK => EntryType::symlink(),
+                syscall::MODE_DIR => EntryType::dir(),
                 _ => EntryType::new(b' '),
             }
         }
@@ -1393,13 +1389,13 @@ impl GnuExtSparseHeader {
     /// Returns a view into this header as a byte array.
     pub fn as_bytes(&self) -> &[u8; 512] {
         debug_assert_eq!(mem::size_of_val(self), 512);
-        unsafe { mem::transmute(self) }
+        unsafe { &*(self as *const GnuExtSparseHeader as *const [u8; 512]) }
     }
 
     /// Returns a view into this header as a byte array.
     pub fn as_mut_bytes(&mut self) -> &mut [u8; 512] {
         debug_assert_eq!(mem::size_of_val(self), 512);
-        unsafe { mem::transmute(self) }
+        unsafe { &mut *(self as *mut GnuExtSparseHeader as *mut [u8; 512]) }
     }
 
     /// Returns a slice of the underlying sparse headers.
@@ -1460,7 +1456,7 @@ fn octal_into<T: fmt::Octal>(dst: &mut [u8], val: T) {
 // Wrapper to figure out if we should fill the header field using tar's numeric
 // extension (binary) or not (octal).
 fn num_field_wrapper_into(dst: &mut [u8], src: u64) {
-    if src >= 8589934592 || (src >= 2097152 && dst.len() == 8) {
+    if src >= 8_589_934_592 || (src >= 2_097_152 && dst.len() == 8) {
         numeric_extended_into(dst, src);
     } else {
         octal_into(dst, src);
@@ -1470,10 +1466,10 @@ fn num_field_wrapper_into(dst: &mut [u8], src: u64) {
 // Wrapper to figure out if we should read the header field in binary (numeric
 // extension) or octal (standard encoding).
 fn num_field_wrapper_from(src: &[u8]) -> io::Result<u64> {
-    if src[0] & 0x80 != 0 {
-        Ok(numeric_extended_from(src))
-    } else {
+    if src[0] & 0x80 == 0 {
         octal_from(src)
+    } else {
+        Ok(numeric_extended_from(src))
     }
 }
 
@@ -1565,7 +1561,7 @@ fn copy_path_into(mut slot: &mut [u8], path: &Path, is_link_name: bool) -> io::R
                 return Err(other("path component in archive cannot contain `/`"));
             }
         }
-        copy(&mut slot, &*bytes)?;
+        copy(&mut slot, &bytes)?;
         if &*bytes != b"/" {
             needs_slash = true;
         }
@@ -1580,8 +1576,8 @@ fn copy_path_into(mut slot: &mut [u8], path: &Path, is_link_name: bool) -> io::R
     return Ok(());
 
     fn copy(slot: &mut &mut [u8], bytes: &[u8]) -> io::Result<()> {
-        copy_into(*slot, bytes)?;
-        let tmp = mem::replace(slot, &mut []);
+        copy_into(slot, bytes)?;
+        let tmp = std::mem::take(slot);
         *slot = &mut tmp[bytes.len()..];
         Ok(())
     }
@@ -1598,7 +1594,7 @@ fn ends_with_slash(p: &Path) -> bool {
     last == Some(b'/' as u16) || last == Some(b'\\' as u16)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "redox"))]
 fn ends_with_slash(p: &Path) -> bool {
     p.as_os_str().as_bytes().ends_with(&[b'/'])
 }
@@ -1625,10 +1621,10 @@ pub fn path2bytes(p: &Path) -> io::Result<Cow<[u8]>> {
         })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "redox"))]
 /// On unix this will never fail
 pub fn path2bytes(p: &Path) -> io::Result<Cow<[u8]>> {
-    Ok(p.as_os_str().as_bytes()).map(Cow::Borrowed)
+    Ok(Cow::Borrowed(p.as_os_str().as_bytes()))
 }
 
 #[cfg(windows)]
@@ -1654,9 +1650,9 @@ pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "redox"))]
 /// On unix this operation can never fail.
-pub fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
+pub fn bytes2path(bytes: Cow<'_, [u8]>) -> io::Result<Cow<'_, Path>> {
     use std::ffi::{OsStr, OsString};
 
     Ok(match bytes {

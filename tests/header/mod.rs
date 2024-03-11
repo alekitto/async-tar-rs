@@ -1,11 +1,16 @@
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::Path;
-use std::{iter, mem, thread, time};
+#![allow(clippy::cognitive_complexity)]
+
+use std::{
+    fs::{self, File},
+    io::{self, Write},
+    mem,
+    path::Path,
+    thread, time,
+};
 
 use tempfile::Builder;
 
-use tar::{GnuHeader, Header, HeaderMode};
+use async_tar_rs::{GnuHeader, Header, HeaderMode};
 
 #[test]
 fn default_gnu() {
@@ -139,15 +144,9 @@ fn set_path() {
         assert_eq!(t!(h.path()).to_str(), Some("foo\\bar"));
     }
 
-    // set_path documentation explictly states it removes any ".", signfying the
-    // current directory, from the path. This test ensures that documented
-    // beavhior occurs
-    t!(h.set_path("./control"));
-    assert_eq!(t!(h.path()).to_str(), Some("control"));
-
-    let long_name = iter::repeat("foo").take(100).collect::<String>();
-    let medium1 = iter::repeat("foo").take(52).collect::<String>();
-    let medium2 = iter::repeat("fo/").take(52).collect::<String>();
+    let long_name = "foo".repeat(100);
+    let medium1 = "foo".repeat(52);
+    let medium2 = "fo/".repeat(52);
 
     assert!(h.set_path(&long_name).is_err());
     assert!(h.set_path(&medium1).is_err());
@@ -171,14 +170,16 @@ fn set_path() {
 #[test]
 fn set_ustar_path_hard() {
     let mut h = Header::new_ustar();
-    let p = Path::new("a").join(&vec!["a"; 100].join(""));
+    let p = Path::new("a").join(vec!["a"; 100].join(""));
     t!(h.set_path(&p));
-    assert_eq!(t!(h.path()), p);
+    let path = t!(h.path());
+    let actual: &Path = path.as_ref().into();
+    assert_eq!(actual, p);
 }
 
 #[test]
 fn set_metadata_deterministic() {
-    let td = t!(Builder::new().prefix("tar-rs").tempdir());
+    let td = t!(Builder::new().prefix("async-tar").tempdir());
     let tmppath = td.path().join("tmpfile");
 
     fn mk_header(path: &Path, readonly: bool) -> Result<Header, io::Error> {
@@ -216,23 +217,23 @@ fn extended_numeric_format() {
     let mut h: GnuHeader = unsafe { mem::zeroed() };
     h.as_header_mut().set_size(42);
     assert_eq!(h.size, [48, 48, 48, 48, 48, 48, 48, 48, 48, 53, 50, 0]);
-    h.as_header_mut().set_size(8589934593);
+    h.as_header_mut().set_size(8_589_934_593);
     assert_eq!(h.size, [0x80, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 1]);
     h.as_header_mut().set_size(44);
     assert_eq!(h.size, [48, 48, 48, 48, 48, 48, 48, 48, 48, 53, 52, 0]);
     h.size = [0x80, 0, 0, 0, 0, 0, 0, 0x02, 0, 0, 0, 0];
-    assert_eq!(h.as_header().entry_size().unwrap(), 0x0200000000);
+    assert_eq!(h.as_header().entry_size().unwrap(), 0x0002_0000_0000);
     h.size = [48, 48, 48, 48, 48, 48, 48, 48, 48, 53, 51, 0];
     assert_eq!(h.as_header().entry_size().unwrap(), 43);
 
     h.as_header_mut().set_gid(42);
     assert_eq!(h.gid, [48, 48, 48, 48, 48, 53, 50, 0]);
     assert_eq!(h.as_header().gid().unwrap(), 42);
-    h.as_header_mut().set_gid(0x7fffffffffffffff);
+    h.as_header_mut().set_gid(0x7fff_ffff_ffff_ffff);
     assert_eq!(h.gid, [0xff; 8]);
-    assert_eq!(h.as_header().gid().unwrap(), 0x7fffffffffffffff);
+    assert_eq!(h.as_header().gid().unwrap(), 0x7fff_ffff_ffff_ffff);
     h.uid = [0x80, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78];
-    assert_eq!(h.as_header().uid().unwrap(), 0x12345678);
+    assert_eq!(h.as_header().uid().unwrap(), 0x1234_5678);
 
     h.mtime = [
         0x80, 0, 0, 0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,

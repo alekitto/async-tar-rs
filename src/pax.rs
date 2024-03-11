@@ -1,8 +1,10 @@
 #![allow(dead_code)]
-use std::io;
-use std::io::Write;
-use std::slice;
-use std::str;
+use std::{slice, str};
+
+#[cfg(feature = "async-std")]
+use async_std::io::{self, Write};
+#[cfg(feature = "tokio")]
+use tokio::io::{self, AsyncWrite as Write};
 
 use crate::other;
 
@@ -148,16 +150,18 @@ impl<'entry> PaxExtension<'entry> {
 }
 
 /// Extension trait for `Builder` to append PAX extended headers.
-impl<T: Write> crate::Builder<T> {
+impl<T: Write + Send + Sync + Unpin> crate::Builder<T> {
     /// Append PAX extended headers to the archive.
     ///
     /// Takes in an iterator over the list of headers to add to convert it into a header set formatted.
     ///
     /// Returns io::Error if an error occurs, else it returns ()
-    pub fn append_pax_extensions<'key, 'value>(
+    pub async fn append_pax_extensions<'key, 'value>(
         &mut self,
         headers: impl IntoIterator<Item = (&'key str, &'value [u8])>,
     ) -> Result<(), io::Error> {
+        use std::io::Write;
+
         // Store the headers formatted before write
         let mut data: Vec<u8> = Vec::new();
 
@@ -190,6 +194,6 @@ impl<T: Write> crate::Builder<T> {
         header.set_size(data_as_bytes.len() as u64);
         header.set_entry_type(crate::EntryType::XHeader);
         header.set_cksum();
-        self.append(&header, data_as_bytes)
+        self.append(&header, data_as_bytes).await
     }
 }

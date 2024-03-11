@@ -17,19 +17,19 @@
 //     implementations are all found in this crate and the generic functions are
 //     all just super thin wrappers (e.g. easy to codegen).
 
-#![doc(html_root_url = "https://docs.rs/tar/0.4")]
 #![deny(missing_docs)]
-#![cfg_attr(test, deny(warnings))]
+#![deny(clippy::all)]
 
-use std::io::{Error, ErrorKind};
-
-pub use crate::archive::{Archive, Entries};
+pub use crate::archive::{Archive, ArchiveBuilder, Entries};
 pub use crate::builder::{Builder, EntryWriter};
 pub use crate::entry::{Entry, Unpacked};
 pub use crate::entry_type::EntryType;
-pub use crate::header::GnuExtSparseHeader;
-pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
+pub use crate::header::{
+    GnuExtSparseHeader, GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader,
+};
 pub use crate::pax::{PaxExtension, PaxExtensions};
+use std::io::{Error, ErrorKind};
+
 
 mod archive;
 mod builder;
@@ -39,6 +39,13 @@ mod error;
 mod header;
 mod pax;
 
+#[cfg(test)]
+#[macro_use]
+extern crate static_assertions;
+
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)
 }
+
+#[cfg(all(feature = "async-std", feature = "tokio"))]
+compile_error!("Cannot enable both async-std and tokio");

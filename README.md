@@ -1,29 +1,27 @@
-# tar-rs
+# async-tar-rs
 
-[Documentation](https://docs.rs/tar)
+[Documentation](https://docs.rs/async-tar-rs)
 
-A tar archive reading/writing library for Rust.
+Async library for reading/writing TAR files for Rust
 
 ```toml
 # Cargo.toml
 [dependencies]
-tar = "0.4"
+async-tar-rs = "0.1"
 ```
 
 ## Reading an archive
 
 ```rust,no_run
-extern crate tar;
-
-use std::io::prelude::*;
-use std::fs::File;
 use tar::Archive;
+use tokio::fs::File;
 
 fn main() {
-    let file = File::open("foo.tar").unwrap();
+    let file = File::open("foo.tar").await.unwrap();
     let mut a = Archive::new(file);
 
-    for file in a.entries().unwrap() {
+    let mut entries = a.entries().unwrap();
+    while let Some(file) = entries.next().await {
         // Make sure there wasn't an I/O error
         let mut file = file.unwrap();
 
@@ -33,7 +31,7 @@ fn main() {
 
         // files implement the Read trait
         let mut s = String::new();
-        file.read_to_string(&mut s).unwrap();
+        file.read_to_string(&mut s).await.unwrap();
         println!("{}", s);
     }
 }
@@ -45,16 +43,18 @@ fn main() {
 ```rust,no_run
 extern crate tar;
 
-use std::io::prelude::*;
-use std::fs::File;
 use tar::Builder;
+use tokio::fs::File;
 
 fn main() {
-    let file = File::create("foo.tar").unwrap();
+    let file = File::create("foo.tar").await.unwrap();
     let mut a = Builder::new(file);
 
-    a.append_path("file1.txt").unwrap();
-    a.append_file("file2.txt", &mut File::open("file3.txt").unwrap()).unwrap();
+    a.append_path("file1.txt").await.unwrap();
+    a.append_file(
+        "file2.txt",
+        &mut File::open("file3.txt").await.unwrap()
+    ).await.unwrap();
 }
 ```
 

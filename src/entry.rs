@@ -1,32 +1,56 @@
-use std::borrow::Cow;
-use std::cmp;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::prelude::*;
-use std::io::{self, Error, ErrorKind, SeekFrom};
-use std::marker;
-use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs::{self, OpenOptions},
+    io::{self, Error, ErrorKind, Read, ReadExt, SeekExt, SeekFrom},
+    os::unix::fs::symlink as symlink_file,
+};
+use std::{
+    borrow::Cow,
+    cmp, fmt, marker,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs::{self, symlink as symlink_file, OpenOptions},
+    io::{
+        self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt, Error, ErrorKind, ReadBuf, SeekFrom,
+    },
+};
+
+use crate::{
+    error::TarError, header::bytes2path, other, Archive, Header, PaxExtensions,
+};
 use filetime::{self, FileTime};
-
+use pin_project::pin_project;
+use std::path::{Component, Path, PathBuf};
+use std::task::ready;
 use crate::archive::ArchiveInner;
-use crate::error::TarError;
-use crate::header::bytes2path;
-use crate::other;
-use crate::{Archive, Header, PaxExtensions};
 
 /// A read-only view into an entry of an archive.
 ///
 /// This structure is a window into a portion of a borrowed archive which can
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
-pub struct Entry<'a, R: 'a + Read> {
+#[pin_project]
+pub struct Entry<'a, R: Read + Unpin> {
+    #[pin]
     fields: EntryFields<'a>,
-    _ignored: marker::PhantomData<&'a Archive<R>>,
+    _ignored: marker::PhantomData<Archive<R>>,
+}
+
+impl<'a, R: Read + Unpin> fmt::Debug for Entry<'a, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("fields", &self.fields)
+            .finish()
+    }
 }
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
+#[pin_project]
 pub struct EntryFields<'a> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
@@ -36,32 +60,67 @@ pub struct EntryFields<'a> {
     pub size: u64,
     pub header_pos: u64,
     pub file_pos: u64,
+    #[pin]
     pub data: Vec<EntryIo<'a>>,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_ownerships: bool,
     pub preserve_mtime: bool,
     pub overwrite: bool,
+    #[pin]
+    pub(crate) read_state: Option<EntryIo<'a>>,
 }
 
+impl<'a> fmt::Debug for EntryFields<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntryFields")
+            .field("long_pathname", &self.long_pathname)
+            .field("long_linkname", &self.long_linkname)
+            .field("pax_extensions", &self.pax_extensions)
+            .field("header", &self.header)
+            .field("size", &self.size)
+            .field("header_pos", &self.header_pos)
+            .field("file_pos", &self.file_pos)
+            .field("data", &self.data)
+            .field("unpack_xattrs", &self.unpack_xattrs)
+            .field("preserve_permissions", &self.preserve_permissions)
+            .field("preserve_ownerships", &self.preserve_ownerships)
+            .field("preserve_mtime", &self.preserve_mtime)
+            .field("overwrite", &self.overwrite)
+            .field("read_state", &self.read_state)
+            .finish()
+    }
+}
+
+#[pin_project(project = EntryIoProject)]
 pub enum EntryIo<'a> {
-    Pad(io::Take<io::Repeat>),
-    Data(io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+    Pad(#[pin] io::Take<io::Repeat>),
+    Data(#[pin] io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+}
+
+impl<'a> fmt::Debug for EntryIo<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EntryIo::Pad(_) => write!(f, "EntryIo::Pad"),
+            EntryIo::Data(_) => write!(f, "EntryIo::Data"),
+        }
+    }
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom
 /// additional handling by users. Today the File is returned, in future
 /// the enum may be extended with kinds for links, directories etc.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Unpacked {
     /// A file was unpacked.
-    File(std::fs::File),
+    File(fs::File),
     /// A directory, hardlink, symlink, or other node was unpacked.
     #[doc(hidden)]
     __Nonexhaustive,
 }
 
-impl<'a, R: Read> Entry<'a, R> {
+impl<'a, R: Read + Unpin + Send> Entry<'a, R> {
     /// Returns the path name for this entry.
     ///
     /// This method may fail if the pathname is not valid Unicode and this is
@@ -132,8 +191,8 @@ impl<'a, R: Read> Entry<'a, R> {
     ///
     /// Also note that this function will read the entire entry if the entry
     /// itself is a list of extensions.
-    pub fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
-        self.fields.pax_extensions()
+    pub async fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions<'_>>> {
+        self.fields.pax_extensions().await
     }
 
     /// Returns access to the header of this entry in the archive.
@@ -141,14 +200,6 @@ impl<'a, R: Read> Entry<'a, R> {
     /// This provides access to the metadata for this entry in the archive.
     pub fn header(&self) -> &Header {
         &self.fields.header
-    }
-
-    /// Returns access to the size of this entry in the archive.
-    ///
-    /// In the event the size is stored in a pax extension, that size value
-    /// will be referenced. Otherwise, the entry size will be stored in the header.
-    pub fn size(&self) -> u64 {
-        self.fields.size
     }
 
     /// Returns the starting position, in bytes, of the header of this entry in
@@ -190,18 +241,25 @@ impl<'a, R: Read> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::fs::File;
-    /// use tar::Archive;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    /// #
+    /// use futures::TryStreamExt;
+    /// use tokio::fs::File;
+    /// use async_tar_rs::Archive;
     ///
-    /// let mut ar = Archive::new(File::open("foo.tar").unwrap());
-    ///
-    /// for (i, file) in ar.entries().unwrap().enumerate() {
-    ///     let mut file = file.unwrap();
-    ///     file.unpack(format!("file-{}", i)).unwrap();
+    /// let mut ar = Archive::new(File::open("foo.tar").await?);
+    /// let mut entries = ar.entries()?;
+    /// let mut i = 0;
+    /// while let Ok(Some(mut file)) = entries.try_next().await {
+    ///     file.unpack(format!("file-{}", i)).await?;
+    ///     i += 1;
     /// }
+    /// #
+    /// # Ok(()) }
     /// ```
-    pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
-        self.fields.unpack(None, dst.as_ref())
+    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
+        self.fields.unpack(None, dst.as_ref()).await
     }
 
     /// Extracts this file under the specified path, avoiding security issues.
@@ -218,32 +276,25 @@ impl<'a, R: Read> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
-    /// use std::fs::File;
-    /// use tar::Archive;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    /// #
+    /// use tokio::fs::File;
+    /// use async_tar_rs::Archive;
+    /// use futures::TryStreamExt;
     ///
-    /// let mut ar = Archive::new(File::open("foo.tar").unwrap());
-    ///
-    /// for (i, file) in ar.entries().unwrap().enumerate() {
-    ///     let mut file = file.unwrap();
-    ///     file.unpack_in("target").unwrap();
+    /// let mut ar = Archive::new(File::open("foo.tar").await?);
+    /// let mut entries = ar.entries()?;
+    /// let mut i = 0;
+    /// while let Ok(Some(mut file)) = entries.try_next().await {
+    ///     file.unpack_in("target").await?;
+    ///     i += 1;
     /// }
+    /// #
+    /// # Ok(()) }
     /// ```
-    pub fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
-        self.fields.unpack_in(dst.as_ref())
-    }
-
-    /// Set the mask of the permission bits when unpacking this entry.
-    ///
-    /// The mask will be inverted when applying against a mode, similar to how
-    /// `umask` works on Unix. In logical notation it looks like:
-    ///
-    /// ```text
-    /// new_mode = old_mode & (~mask)
-    /// ```
-    ///
-    /// The mask is 0 by default and is currently only implemented on Unix.
-    pub fn set_mask(&mut self, mask: u32) {
-        self.fields.mask = mask;
+    pub async fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
+        self.fields.unpack_in(dst.as_ref()).await
     }
 
     /// Indicate whether extended file attributes (xattrs on Unix) are preserved
@@ -275,56 +326,84 @@ impl<'a, R: Read> Entry<'a, R> {
     }
 }
 
-impl<'a, R: Read> Read for Entry<'a, R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.fields.read(into)
+impl<'a, R: Read + Unpin> Read for Entry<'a, R> {
+    #[cfg(feature = "async-std")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        into: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+        Pin::new(&mut *this.fields).poll_read(cx, into)
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut this = self.project();
+        Pin::new(&mut *this.fields).poll_read(cx, buf)
     }
 }
 
-impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+impl<'a, R: Read + Unpin + Send> EntryFields<'a> {
+    pub fn from(entry: Entry<R>) -> Self {
         entry.fields
     }
 
-    pub fn into_entry<R: Read>(self) -> Entry<'a, R> {
+    pub fn into_entry(self) -> Entry<'a, R> {
         Entry {
             fields: self,
             _ignored: marker::PhantomData,
         }
     }
 
-    pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
+    pub(crate) fn poll_read_all(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Vec<u8>>> {
+        // Preallocate some data but don't let ourselves get too crazy now.
+        let cap = cmp::min(self.size, 128 * 1024);
+        let mut buf = Vec::with_capacity(cap as usize);
+
+        // Copied from futures::ReadToEnd
+        match ready!(poll_read_all_internal(self, cx, &mut buf)) {
+            Ok(_) => Poll::Ready(Ok(buf)),
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    pub async fn read_all(&mut self) -> io::Result<Vec<u8>> {
         // Preallocate some data but don't let ourselves get too crazy now.
         let cap = cmp::min(self.size, 128 * 1024);
         let mut v = Vec::with_capacity(cap as usize);
-        self.read_to_end(&mut v).map(|_| v)
+        self.read_to_end(&mut v).await.map(|_| v)
     }
 
-    fn path(&self) -> io::Result<Cow<Path>> {
+    fn path(&self) -> io::Result<Cow<'_, Path>> {
         bytes2path(self.path_bytes())
     }
 
     fn path_bytes(&self) -> Cow<[u8]> {
-        match self.long_pathname {
-            Some(ref bytes) => {
-                if let Some(&0) = bytes.last() {
-                    Cow::Borrowed(&bytes[..bytes.len() - 1])
-                } else {
-                    Cow::Borrowed(bytes)
+        if let Some(ref bytes) = self.long_pathname {
+            if let Some(&0) = bytes.last() {
+                Cow::Borrowed(&bytes[..bytes.len() - 1])
+            } else {
+                Cow::Borrowed(bytes)
+            }
+        } else {
+            if let Some(ref pax) = self.pax_extensions {
+                let pax = PaxExtensions::new(pax)
+                    .filter_map(Result::ok)
+                    .find(|f| f.key_bytes() == b"path")
+                    .map(|f| f.value_bytes());
+                if let Some(field) = pax {
+                    return Cow::Borrowed(field);
                 }
             }
-            None => {
-                if let Some(ref pax) = self.pax_extensions {
-                    let pax = PaxExtensions::new(pax)
-                        .filter_map(|f| f.ok())
-                        .find(|f| f.key_bytes() == b"path")
-                        .map(|f| f.value_bytes());
-                    if let Some(field) = pax {
-                        return Cow::Borrowed(field);
-                    }
-                }
-                self.header.path_bytes()
-            }
+            self.header.path_bytes()
         }
     }
 
@@ -349,36 +428,26 @@ impl<'a> EntryFields<'a> {
                     Some(Cow::Borrowed(bytes))
                 }
             }
-            None => {
-                if let Some(ref pax) = self.pax_extensions {
-                    let pax = PaxExtensions::new(pax)
-                        .filter_map(|f| f.ok())
-                        .find(|f| f.key_bytes() == b"linkpath")
-                        .map(|f| f.value_bytes());
-                    if let Some(field) = pax {
-                        return Some(Cow::Borrowed(field));
-                    }
-                }
-                self.header.link_name_bytes()
-            }
+            None => self.header.link_name_bytes(),
         }
     }
 
-    fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions>> {
+    async fn pax_extensions(&mut self) -> io::Result<Option<PaxExtensions<'_>>> {
         if self.pax_extensions.is_none() {
             if !self.header.entry_type().is_pax_global_extensions()
                 && !self.header.entry_type().is_pax_local_extensions()
             {
                 return Ok(None);
             }
-            self.pax_extensions = Some(self.read_all()?);
+            self.pax_extensions = Some(self.read_all().await?);
         }
+
         Ok(Some(PaxExtensions::new(
             self.pax_extensions.as_ref().unwrap(),
         )))
     }
 
-    fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
+    async fn unpack_in(&mut self, dst: &Path) -> io::Result<bool> {
         // Notes regarding bsdtar 2.8.3 / libarchive 2.8.3:
         // * Leading '/'s are trimmed. For example, `///test` is treated as
         //   `test`.
@@ -396,7 +465,7 @@ impl<'a> EntryFields<'a> {
         {
             let path = self.path().map_err(|e| {
                 TarError::new(
-                    format!("invalid path in entry header: {}", self.path_lossy()),
+                    &format!("invalid path in entry header: {}", self.path_lossy()),
                     e,
                 )
             })?;
@@ -430,39 +499,44 @@ impl<'a> EntryFields<'a> {
             None => return Ok(false),
         };
 
-        self.ensure_dir_created(&dst, parent)
-            .map_err(|e| TarError::new(format!("failed to create `{}`", parent.display()), e))?;
+        self.ensure_dir_created(dst, parent)
+            .await
+            .map_err(|e| TarError::new(&format!("failed to create `{}`", parent.display()), e))?;
 
-        let canon_target = self.validate_inside_dst(&dst, parent)?;
+        let canon_target = self.validate_inside_dst(dst, parent).await?;
 
         self.unpack(Some(&canon_target), &file_dst)
-            .map_err(|e| TarError::new(format!("failed to unpack `{}`", file_dst.display()), e))?;
+            .await
+            .map_err(|e| TarError::new(&format!("failed to unpack `{}`", file_dst.display()), e))?;
 
         Ok(true)
     }
 
     /// Unpack as destination directory `dst`.
-    fn unpack_dir(&mut self, dst: &Path) -> io::Result<()> {
+    async fn unpack_dir(&mut self, dst: &Path) -> io::Result<()> {
         // If the directory already exists just let it slide
-        fs::create_dir(dst).or_else(|err| {
-            if err.kind() == ErrorKind::AlreadyExists {
-                let prev = fs::metadata(dst);
-                if prev.map(|m| m.is_dir()).unwrap_or(false) {
-                    return Ok(());
+        match fs::create_dir(dst).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if err.kind() == ErrorKind::AlreadyExists {
+                    let prev = fs::metadata(dst).await;
+                    if prev.map(|m| m.is_dir()).unwrap_or(false) {
+                        return Ok(());
+                    }
                 }
+                Err(Error::new(
+                    err.kind(),
+                    format!("{} when creating dir {}", err, dst.display()),
+                ))
             }
-            Err(Error::new(
-                err.kind(),
-                format!("{} when creating dir {}", err, dst.display()),
-            ))
-        })
+        }
     }
 
     /// Returns access to the header of this entry in the archive.
-    fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
-        fn set_perms_ownerships(
+    async fn unpack(&mut self, target_base: Option<&Path>, dst: &Path) -> io::Result<Unpacked> {
+        async fn set_perms_ownerships(
             dst: &Path,
-            f: Option<&mut std::fs::File>,
+            f: Option<&mut fs::File>,
             header: &Header,
             mask: u32,
             perms: bool,
@@ -474,29 +548,16 @@ impl<'a> EntryFields<'a> {
             }
             // ... then set permissions, SUID bits set here is kept
             if let Ok(mode) = header.mode() {
-                set_perms(dst, f, mode, mask, perms)?;
+                set_perms(dst, f, mode, mask, perms).await?;
             }
 
             Ok(())
         }
 
-        fn get_mtime(header: &Header) -> Option<FileTime> {
-            header.mtime().ok().map(|mtime| {
-                // For some more information on this see the comments in
-                // `Header::fill_platform_from`, but the general idea is that
-                // we're trying to avoid 0-mtime files coming out of archives
-                // since some tools don't ingest them well. Perhaps one day
-                // when Cargo stops working with 0-mtime archives we can remove
-                // this.
-                let mtime = if mtime == 0 { 1 } else { mtime };
-                FileTime::from_unix_time(mtime as i64, 0)
-            })
-        }
-
         let kind = self.header.entry_type();
 
         if kind.is_dir() {
-            self.unpack_dir(dst)?;
+            self.unpack_dir(dst).await?;
             set_perms_ownerships(
                 dst,
                 None,
@@ -504,7 +565,8 @@ impl<'a> EntryFields<'a> {
                 self.mask,
                 self.preserve_permissions,
                 self.preserve_ownerships,
-            )?;
+            ).await?;
+
             return Ok(Unpacked::__Nonexhaustive);
         } else if kind.is_hard_link() || kind.is_symlink() {
             let src = match self.link_name()? {
@@ -537,14 +599,14 @@ impl<'a> EntryFields<'a> {
                     // use canonicalization to ensure this guarantee. For hard
                     // links though they're canonicalized to their existing path
                     // so we need to validate at this time.
-                    Some(ref p) => {
+                    Some(p) => {
                         let link_src = p.join(src);
-                        self.validate_inside_dst(p, &link_src)?;
+                        self.validate_inside_dst(p, &link_src).await?;
                         link_src
                     }
                     None => src.into_owned(),
                 };
-                fs::hard_link(&link_src, dst).map_err(|err| {
+                fs::hard_link(&link_src, dst).await.map_err(|err| {
                     Error::new(
                         err.kind(),
                         format!(
@@ -556,15 +618,23 @@ impl<'a> EntryFields<'a> {
                     )
                 })?;
             } else {
-                symlink(&src, dst)
-                    .or_else(|err_io| {
-                        if err_io.kind() == io::ErrorKind::AlreadyExists && self.overwrite {
+                let overwrite = self.overwrite;
+                match symlink(&src, dst).await {
+                    Err(err_io) => {
+                        if err_io.kind() == ErrorKind::AlreadyExists && overwrite {
                             // remove dest and try once more
-                            std::fs::remove_file(dst).and_then(|()| symlink(&src, dst))
+                            let result = fs::remove_file(dst).await;
+                            if result.is_ok() {
+                                symlink(&src, dst).await
+                            } else {
+                                result
+                            }
                         } else {
                             Err(err_io)
                         }
-                    })
+                    }
+                    Ok(r) => Ok(r),
+                }
                     .map_err(|err| {
                         Error::new(
                             err.kind(),
@@ -580,12 +650,15 @@ impl<'a> EntryFields<'a> {
                 // of symlinks is important as it dictates the access control to the symlink
                 // itself.
                 if self.preserve_ownerships {
-                    set_ownerships(dst, &None, self.header.uid()?, self.header.gid()?)?;
+                    _set_ownerships(dst, &None, self.header.uid()?, self.header.gid()?)?;
                 }
                 if self.preserve_mtime {
                     if let Some(mtime) = get_mtime(&self.header) {
                         filetime::set_symlink_file_times(dst, mtime, mtime).map_err(|e| {
-                            TarError::new(format!("failed to set mtime for `{}`", dst.display()), e)
+                            TarError::new(
+                                &format!("failed to set mtime for `{}`", dst.display()),
+                                e,
+                            )
                         })?;
                     }
                 }
@@ -594,18 +667,18 @@ impl<'a> EntryFields<'a> {
 
             #[cfg(target_arch = "wasm32")]
             #[allow(unused_variables)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
                 Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
             }
 
             #[cfg(windows)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                ::std::os::windows::fs::symlink_file(src, dst)
+            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+                async_std::os::windows::fs::symlink_file(src, dst).await
             }
 
-            #[cfg(unix)]
-            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                ::std::os::unix::fs::symlink(src, dst)
+            #[cfg(any(unix, target_os = "redox"))]
+            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+                symlink_file(src, dst).await
             }
         } else if kind.is_pax_global_extensions()
             || kind.is_pax_local_extensions()
@@ -619,7 +692,7 @@ impl<'a> EntryFields<'a> {
         // Names that have a trailing slash should be treated as a directory.
         // Only applies to old headers.
         if self.header.as_ustar().is_none() && self.path_bytes().ends_with(b"/") {
-            self.unpack_dir(dst)?;
+            self.unpack_dir(dst).await?;
             set_perms_ownerships(
                 dst,
                 None,
@@ -627,7 +700,8 @@ impl<'a> EntryFields<'a> {
                 self.mask,
                 self.preserve_permissions,
                 self.preserve_ownerships,
-            )?;
+            ).await?;
+
             return Ok(Unpacked::__Nonexhaustive);
         }
 
@@ -642,45 +716,51 @@ impl<'a> EntryFields<'a> {
 
         // Ensure we write a new file rather than overwriting in-place which
         // is attackable; if an existing file is found unlink it.
-        fn open(dst: &Path) -> io::Result<std::fs::File> {
-            OpenOptions::new().write(true).create_new(true).open(dst)
+        async fn open(dst: &Path) -> io::Result<fs::File> {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)
+                .await
         }
-        let mut f = (|| -> io::Result<std::fs::File> {
-            let mut f = open(dst).or_else(|err| {
-                if err.kind() != ErrorKind::AlreadyExists {
-                    Err(err)
-                } else if self.overwrite {
-                    match fs::remove_file(dst) {
-                        Ok(()) => open(dst),
-                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst),
-                        Err(e) => Err(e),
+        let mut f = async {
+            let mut f = match open(dst).await {
+                Ok(f) => Ok(f),
+                Err(err) => {
+                    if err.kind() == ErrorKind::AlreadyExists {
+                        match fs::remove_file(dst).await {
+                            Ok(()) => open(dst).await,
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst).await,
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Err(err)
                     }
-                } else {
-                    Err(err)
                 }
-            })?;
+            }?;
             for io in self.data.drain(..) {
                 match io {
                     EntryIo::Data(mut d) => {
                         let expected = d.limit();
-                        if io::copy(&mut d, &mut f)? != expected {
+                        if io::copy(&mut d, &mut f).await? != expected {
                             return Err(other("failed to write entire file"));
                         }
                     }
                     EntryIo::Pad(d) => {
                         // TODO: checked cast to i64
                         let to = SeekFrom::Current(d.limit() as i64);
-                        let size = f.seek(to)?;
-                        f.set_len(size)?;
+                        let size = f.seek(to).await?;
+                        f.set_len(size).await?;
                     }
                 }
             }
-            Ok(f)
-        })()
+            Ok::<fs::File, io::Error>(f)
+        }
+        .await
         .map_err(|e| {
             let header = self.header.path_bytes();
             TarError::new(
-                format!(
+                &format!(
                     "failed to unpack `{}` into `{}`",
                     String::from_utf8_lossy(&header),
                     dst.display()
@@ -690,12 +770,14 @@ impl<'a> EntryFields<'a> {
         })?;
 
         if self.preserve_mtime {
-            if let Some(mtime) = get_mtime(&self.header) {
-                filetime::set_file_handle_times(&f, Some(mtime), Some(mtime)).map_err(|e| {
-                    TarError::new(format!("failed to set mtime for `{}`", dst.display()), e)
+            if let Ok(mtime) = self.header.mtime() {
+                let mtime = FileTime::from_unix_time(mtime as i64, 0);
+                filetime::set_file_times(dst, mtime, mtime).map_err(|e| {
+                    TarError::new(&format!("failed to set mtime for `{}`", dst.display()), e)
                 })?;
             }
         }
+
         set_perms_ownerships(
             dst,
             Some(&mut f),
@@ -703,21 +785,35 @@ impl<'a> EntryFields<'a> {
             self.mask,
             self.preserve_permissions,
             self.preserve_ownerships,
-        )?;
+        ).await?;
+
         if self.unpack_xattrs {
-            set_xattrs(self, dst)?;
+            set_xattrs(self, dst).await?;
         }
         return Ok(Unpacked::File(f));
 
+        fn get_mtime(header: &Header) -> Option<FileTime> {
+            header.mtime().ok().map(|mtime| {
+                // For some more information on this see the comments in
+                // `Header::fill_platform_from`, but the general idea is that
+                // we're trying to avoid 0-mtime files coming out of archives
+                // since some tools don't ingest them well. Perhaps one day
+                // when Cargo stops working with 0-mtime archives we can remove
+                // this.
+                let mtime = if mtime == 0 { 1 } else { mtime };
+                FileTime::from_unix_time(mtime as i64, 0)
+            })
+        }
+
         fn set_ownerships(
             dst: &Path,
-            f: &Option<&mut std::fs::File>,
+            f: &Option<&mut fs::File>,
             uid: u64,
             gid: u64,
         ) -> Result<(), TarError> {
             _set_ownerships(dst, f, uid, gid).map_err(|e| {
                 TarError::new(
-                    format!(
+                    &format!(
                         "failed to set ownerships to uid={:?}, gid={:?} \
                          for `{}`",
                         uid,
@@ -732,36 +828,36 @@ impl<'a> EntryFields<'a> {
         #[cfg(unix)]
         fn _set_ownerships(
             dst: &Path,
-            f: &Option<&mut std::fs::File>,
+            f: &Option<&mut fs::File>,
             uid: u64,
             gid: u64,
         ) -> io::Result<()> {
             use std::os::unix::prelude::*;
 
-            let uid: libc::uid_t = uid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("UID {} is too large!", uid))
-            })?;
-            let gid: libc::gid_t = gid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("GID {} is too large!", gid))
-            })?;
+            let uid: libc::uid_t = uid
+                .try_into()
+                .map_err(|_| Error::new(ErrorKind::Other, format!("UID {} is too large!", uid)))?;
+            let gid: libc::gid_t = gid
+                .try_into()
+                .map_err(|_| Error::new(ErrorKind::Other, format!("GID {} is too large!", gid)))?;
             match f {
                 Some(f) => unsafe {
                     let fd = f.as_raw_fd();
                     if libc::fchown(fd, uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
+                        Err(Error::last_os_error())
                     } else {
                         Ok(())
                     }
                 },
                 None => unsafe {
                     let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        Error::new(
+                            ErrorKind::Other,
                             format!("path contains null character: {:?}", e),
                         )
                     })?;
                     if libc::lchown(path.as_ptr(), uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
+                        Err(Error::last_os_error())
                     } else {
                         Ok(())
                     }
@@ -780,16 +876,16 @@ impl<'a> EntryFields<'a> {
             Ok(())
         }
 
-        fn set_perms(
+        async fn set_perms(
             dst: &Path,
-            f: Option<&mut std::fs::File>,
+            f: Option<&mut fs::File>,
             mode: u32,
             mask: u32,
             preserve: bool,
         ) -> Result<(), TarError> {
-            _set_perms(dst, f, mode, mask, preserve).map_err(|e| {
+            _set_perms(dst, f, mode, mask, preserve).await.map_err(|e| {
                 TarError::new(
-                    format!(
+                    &format!(
                         "failed to set permissions to {:o} \
                          for `{}`",
                         mode,
@@ -801,9 +897,9 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(unix)]
-        fn _set_perms(
+        async fn _set_perms(
             dst: &Path,
-            f: Option<&mut std::fs::File>,
+            f: Option<&mut fs::File>,
             mode: u32,
             mask: u32,
             preserve: bool,
@@ -812,17 +908,17 @@ impl<'a> EntryFields<'a> {
 
             let mode = if preserve { mode } else { mode & 0o777 };
             let mode = mode & !mask;
-            let perm = fs::Permissions::from_mode(mode as _);
+            let perm = std::fs::Permissions::from_mode(mode as _);
             match f {
-                Some(f) => f.set_permissions(perm),
-                None => fs::set_permissions(dst, perm),
+                Some(f) => f.set_permissions(perm).await,
+                None => fs::set_permissions(dst, perm).await,
             }
         }
 
         #[cfg(windows)]
         fn _set_perms(
             dst: &Path,
-            f: Option<&mut std::fs::File>,
+            f: Option<&mut fs::File>,
             mode: u32,
             _mask: u32,
             _preserve: bool,
@@ -848,7 +944,7 @@ impl<'a> EntryFields<'a> {
         #[allow(unused_variables)]
         fn _set_perms(
             dst: &Path,
-            f: Option<&mut std::fs::File>,
+            f: Option<&mut fs::File>,
             mode: u32,
             mask: u32,
             _preserve: bool,
@@ -857,16 +953,18 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(all(unix, feature = "xattr"))]
-        fn set_xattrs(me: &mut EntryFields, dst: &Path) -> io::Result<()> {
-            use std::ffi::OsStr;
-            use std::os::unix::prelude::*;
+        async fn set_xattrs<'a>(
+            me: &mut EntryFields<'a>,
+            dst: &Path,
+        ) -> io::Result<()> {
+            use std::{ffi::OsStr, os::unix::prelude::*};
 
-            let exts = match me.pax_extensions() {
+            let exts = match me.pax_extensions().await {
                 Ok(Some(e)) => e,
                 _ => return Ok(()),
             };
             let exts = exts
-                .filter_map(|e| e.ok())
+                .filter_map(Result::ok)
                 .filter_map(|e| {
                     let key = e.key_bytes();
                     let prefix = crate::pax::PAX_SCHILYXATTR.as_bytes();
@@ -877,7 +975,7 @@ impl<'a> EntryFields<'a> {
             for (key, value) in exts {
                 xattr::set(dst, key, value).map_err(|e| {
                     TarError::new(
-                        format!(
+                        &format!(
                             "failed to set extended \
                              attributes to {}. \
                              Xattrs: key={:?}, value={:?}.",
@@ -894,13 +992,18 @@ impl<'a> EntryFields<'a> {
         }
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+        #[cfg(any(
+            windows,
+            target_os = "redox",
+            not(feature = "xattr"),
+            target_arch = "wasm32"
+        ))]
+        async fn set_xattrs<R: Read + Unpin>(_: &mut EntryFields<R>, _: &Path) -> io::Result<()> {
             Ok(())
         }
     }
 
-    fn ensure_dir_created(&self, dst: &Path, dir: &Path) -> io::Result<()> {
+    async fn ensure_dir_created(&self, dst: &Path, dir: &Path) -> io::Result<()> {
         let mut ancestor = dir;
         let mut dirs_to_create = Vec::new();
         while ancestor.symlink_metadata().is_err() {
@@ -913,15 +1016,15 @@ impl<'a> EntryFields<'a> {
         }
         for ancestor in dirs_to_create.into_iter().rev() {
             if let Some(parent) = ancestor.parent() {
-                self.validate_inside_dst(dst, parent)?;
+                self.validate_inside_dst(dst, parent).await?;
             }
-            fs::create_dir_all(ancestor)?;
+            fs::create_dir(ancestor).await?;
         }
         Ok(())
     }
 
-    fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
-        // Abort if target (canonical) parent is outside of `dst`
+    async fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
+        // Abort if target (canonical) parent is outside `dst`
         let canon_parent = file_dst.canonicalize().map_err(|err| {
             Error::new(
                 err.kind(),
@@ -936,7 +1039,7 @@ impl<'a> EntryFields<'a> {
         })?;
         if !canon_parent.starts_with(&canon_target) {
             let err = TarError::new(
-                format!(
+                &format!(
                     "trying to unpack outside of destination path: {}",
                     canon_target.display()
                 ),
@@ -950,24 +1053,195 @@ impl<'a> EntryFields<'a> {
 }
 
 impl<'a> Read for EntryFields<'a> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+    #[cfg(feature = "async-std")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        into: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
         loop {
-            match self.data.get_mut(0).map(|io| io.read(into)) {
-                Some(Ok(0)) => {
-                    self.data.remove(0);
+            if this.read_state.is_none() {
+                if this.data.as_ref().is_empty() {
+                    *this.read_state = None;
+                } else {
+                    let data = &mut *this.data;
+                    *this.read_state = Some(data.remove(0));
                 }
-                Some(r) => return r,
-                None => return Ok(0),
             }
+
+            if let Some(ref mut io) = &mut *this.read_state {
+                let ret = Pin::new(io).poll_read(cx, into);
+                match ret {
+                    Poll::Ready(Ok(0)) => {
+                        *this.read_state = None;
+                        if this.data.as_ref().is_empty() {
+                            return Poll::Ready(Ok(0));
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Ok(val)) => {
+                        return Poll::Ready(Ok(val));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                }
+            }
+            // Unable to pull another value from `data`, so we are done.
+            return Poll::Ready(Ok(0));
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut this = self.project();
+        loop {
+            if this.read_state.is_none() {
+                if this.data.as_ref().is_empty() {
+                    *this.read_state = None;
+                } else {
+                    let data = &mut *this.data;
+                    *this.read_state = Some(data.remove(0));
+                }
+            }
+
+            if let Some(ref mut io) = &mut *this.read_state {
+                let prev_len = buf.filled().len();
+                let ret = Pin::new(io).poll_read(cx, buf);
+                match ret {
+                    Poll::Ready(Ok(())) => {
+                        let len = buf.filled().len();
+                        if len == prev_len {
+                            *this.read_state = None;
+                            if this.data.as_ref().is_empty() {
+                                return Poll::Ready(Ok(()));
+                            }
+
+                            continue;
+                        } else {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                }
+            }
+            // Unable to pull another value from `data`, so we are done.
+            return Poll::Ready(Ok(()));
         }
     }
 }
 
 impl<'a> Read for EntryIo<'a> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match *self {
-            EntryIo::Pad(ref mut io) => io.read(into),
-            EntryIo::Data(ref mut io) => io.read(into),
+    #[cfg(feature = "async-std")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        into: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.project() {
+            EntryIoProject::Pad(io) => io.poll_read(cx, into),
+            EntryIoProject::Data(io) => io.poll_read(cx, into),
         }
     }
+
+    #[cfg(feature = "tokio")]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.project() {
+            EntryIoProject::Pad(io) => io.poll_read(cx, buf),
+            EntryIoProject::Data(io) => io.poll_read(cx, buf),
+        }
+    }
+}
+
+struct Guard<'a> {
+    buf: &'a mut Vec<u8>,
+    len: usize,
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.buf.set_len(self.len);
+        }
+    }
+}
+
+fn poll_read_all_internal<R: Read + ?Sized>(
+    mut rd: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    buf: &mut Vec<u8>,
+) -> Poll<io::Result<usize>> {
+    let mut g = Guard {
+        len: buf.len(),
+        buf,
+    };
+    let ret;
+    loop {
+        if g.len == g.buf.len() {
+            unsafe {
+                g.buf.reserve(32);
+                let capacity = g.buf.capacity();
+                g.buf.set_len(capacity);
+
+                let buf = &mut g.buf[g.len..];
+                std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
+            }
+        }
+
+        #[cfg(feature = "async-std")]
+        {
+            match ready!(rd.as_mut().poll_read(cx, &mut g.buf[g.len..])) {
+                Ok(0) => {
+                    ret = Poll::Ready(Ok(g.len));
+                    break;
+                }
+                Ok(n) => g.len += n,
+                Err(e) => {
+                    ret = Poll::Ready(Err(e));
+                    break;
+                }
+            }
+        }
+
+        #[cfg(feature = "tokio")]
+        {
+            let mut read_buf = ReadBuf::new(&mut g.buf);
+            read_buf.set_filled(g.len);
+
+            match ready!(rd.as_mut().poll_read(cx, &mut read_buf)) {
+                Ok(()) => {
+                    let len = read_buf.filled().len();
+                    if len == g.len {
+                        ret = Poll::Ready(Ok(g.len));
+                        break;
+                    } else {
+                        g.len += len;
+                    }
+                }
+                Err(e) => {
+                    ret = Poll::Ready(Err(e));
+                    break;
+                }
+            }
+        }
+    }
+
+    ret
 }
