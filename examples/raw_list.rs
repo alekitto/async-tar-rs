@@ -4,13 +4,16 @@
 
 extern crate tar;
 
-use std::io::stdin;
+use tokio::io::stdin;
 
 use tar::Archive;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut ar = Archive::new(stdin());
-    for (i, file) in ar.entries().unwrap().raw(true).enumerate() {
+    let mut entries = ar.entries().unwrap().raw(true);
+    let mut i = 0;
+    while let Some(file) = entries.next().await {
         println!("-------------------------- Entry {}", i);
         let mut f = file.unwrap();
         println!("path: {}", f.path().unwrap().display());
@@ -33,7 +36,7 @@ fn main() {
             println!("kind: normal");
         }
 
-        if let Ok(Some(extensions)) = f.pax_extensions() {
+        if let Ok(Some(extensions)) = f.pax_extensions().await {
             println!("pax extensions:");
             for e in extensions {
                 let e = e.unwrap();
@@ -44,5 +47,7 @@ fn main() {
                 );
             }
         }
+
+        i += 1;
     }
 }

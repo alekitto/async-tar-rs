@@ -4,13 +4,15 @@
 
 extern crate tar;
 
-use std::io::stdin;
+use tokio::io::stdin;
 
 use tar::Archive;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut ar = Archive::new(stdin());
-    for file in ar.entries().unwrap() {
+    let mut entries = ar.entries().unwrap();
+    while let Some(file) = entries.next().await {
         let f = file.unwrap();
         println!("{}", f.path().unwrap().display());
     }

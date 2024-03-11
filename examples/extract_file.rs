@@ -7,19 +7,21 @@
 extern crate tar;
 
 use std::env::args_os;
-use std::io::{copy, stdin, stdout};
 use std::path::Path;
+use tokio::io::{copy, stdin, stdout};
 
 use tar::Archive;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let first_arg = args_os().skip(1).next().unwrap();
     let filename = Path::new(&first_arg);
     let mut ar = Archive::new(stdin());
-    for file in ar.entries().unwrap() {
+    let mut entries = ar.entries().unwrap();
+    while let Some(file) = entries.next().await {
         let mut f = file.unwrap();
         if f.path().unwrap() == filename {
-            copy(&mut f, &mut stdout()).unwrap();
+            copy(&mut f, &mut stdout()).await.unwrap();
         }
     }
 }
