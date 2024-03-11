@@ -1,24 +1,16 @@
-extern crate core;
-extern crate filetime;
-extern crate tar;
-extern crate tempfile;
-#[cfg(all(unix, feature = "xattr"))]
-extern crate xattr;
-
+use async_tar_rs::{Archive, Builder, Entries, EntryType, Header, HeaderMode};
+use filetime::FileTime;
+use pin_project::pin_project;
 use std::io::{Cursor, SeekFrom};
 use std::iter::repeat;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tempfile::{Builder as TempBuilder, TempDir};
 use tokio::fs::{self, File};
 use tokio::io::{
     self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
-
-use filetime::FileTime;
-use pin_project::pin_project;
-use tar::{Archive, Builder, Entries, EntryType, Header, HeaderMode};
-use tempfile::{Builder as TempBuilder, TempDir};
 
 macro_rules! t {
     ($e:expr) => {
@@ -72,7 +64,7 @@ async fn simple_concat() {
 
     async fn decode_names<R>(ar: &mut Archive<R>) -> Vec<String>
     where
-        R: Read + Unpin,
+        R: Read + Send + Unpin,
     {
         let mut names = Vec::new();
         let mut entries = t!(ar.entries());
@@ -217,7 +209,7 @@ async fn large_filename() {
     assert!(entries.next().await.is_none());
 }
 
-async fn reading_entries_common<R: Read + Unpin>(mut entries: Entries<'_, R>) {
+async fn reading_entries_common<R: Read + Send + Unpin>(mut entries: Entries<'_, R>) {
     let mut a = t!(entries.next().await.unwrap());
     assert_eq!(&*a.header().path_bytes(), b"a");
     let mut s = String::new();
@@ -646,7 +638,7 @@ async fn extracting_malicious_tarball() {
 
     {
         let mut a = Builder::new(&mut evil_tar);
-        async fn append<T: AsyncWrite + Unpin>(a: &mut Builder<T>, path: &str) {
+        async fn append<T: AsyncWrite + Send + Unpin>(a: &mut Builder<T>, path: &str) {
             let mut header = Header::new_gnu();
             assert!(header.set_path(path).is_err(), "was ok: {:?}", path);
             {
@@ -1081,7 +1073,10 @@ async fn long_linkname_trailing_nul() {
 
 #[tokio::test]
 async fn long_linkname_gnu() {
-    for t in [tar::EntryType::Symlink, tar::EntryType::Link] {
+    for t in [
+        async_tar_rs::EntryType::Symlink,
+        async_tar_rs::EntryType::Link,
+    ] {
         let mut b = Builder::new(Vec::<u8>::new());
         let mut h = Header::new_gnu();
         h.set_entry_type(t);
@@ -1102,7 +1097,10 @@ async fn long_linkname_gnu() {
 
 #[tokio::test]
 async fn linkname_literal() {
-    for t in [tar::EntryType::Symlink, tar::EntryType::Link] {
+    for t in [
+        async_tar_rs::EntryType::Symlink,
+        async_tar_rs::EntryType::Link,
+    ] {
         let mut b = Builder::new(Vec::<u8>::new());
         let mut h = Header::new_gnu();
         h.set_entry_type(t);
@@ -1467,7 +1465,7 @@ async fn unpack_path_larger_than_windows_max_path() {
 
 #[tokio::test]
 async fn append_long_multibyte() {
-    let mut x = tar::Builder::new(Vec::new());
+    let mut x = async_tar_rs::Builder::new(Vec::new());
     let mut name = String::new();
     let data: &[u8] = &[];
     for _ in 0..512 {

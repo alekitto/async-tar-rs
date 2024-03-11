@@ -11,14 +11,14 @@ use crate::{other, EntryType, Header};
 ///
 /// This structure has methods for building up an archive from scratch into any
 /// arbitrary writer.
-pub struct Builder<W: Write + Unpin> {
+pub struct Builder<W: Write + Send + Unpin> {
     mode: HeaderMode,
     follow: bool,
     finished: bool,
     obj: Option<W>,
 }
 
-impl<W: Write + Unpin> Builder<W> {
+impl<W: Write + Send + Unpin> Builder<W> {
     /// Create a new archive builder with the underlying object as the
     /// destination of all data written. The builder will use
     /// `HeaderMode::Complete` by default.
@@ -107,7 +107,7 @@ impl<W: Write + Unpin> Builder<W> {
     /// ar.append(&header, data).await.unwrap();
     /// let data = ar.into_inner().await.unwrap();
     /// ```
-    pub async fn append<R: Read + Unpin>(
+    pub async fn append<R: Read + Send + Unpin>(
         &mut self,
         header: &Header,
         mut data: R,
@@ -157,7 +157,7 @@ impl<W: Write + Unpin> Builder<W> {
     ///     .unwrap();
     /// let data = ar.into_inner().await.unwrap();
     /// ```
-    pub async fn append_data<P: AsRef<Path>, R: Read + Unpin>(
+    pub async fn append_data<P: AsRef<Path>, R: Read + Send + Unpin>(
         &mut self,
         header: &mut Header,
         path: P,
@@ -428,9 +428,9 @@ impl<W: Write + Unpin> Builder<W> {
 }
 
 async fn append(
-    mut dst: &mut (dyn Write + Unpin),
+    mut dst: &mut (dyn Write + Send + Unpin),
     header: &Header,
-    mut data: &mut (dyn Read + Unpin),
+    mut data: &mut (dyn Read + Send + Unpin),
 ) -> io::Result<()> {
     dst.write_all(header.as_bytes()).await?;
     let len = io::copy(&mut data, &mut dst).await?;
@@ -446,7 +446,7 @@ async fn append(
 }
 
 async fn append_path_with_name(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     name: Option<&Path>,
     mode: HeaderMode,
@@ -505,7 +505,7 @@ async fn append_path_with_name(
 
 #[cfg(unix)]
 async fn append_special(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     stat: &Metadata,
     mode: HeaderMode,
@@ -548,7 +548,7 @@ async fn append_special(
 }
 
 async fn append_file(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     file: &mut fs::File,
     mode: HeaderMode,
@@ -558,7 +558,7 @@ async fn append_file(
 }
 
 async fn append_dir(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -583,7 +583,7 @@ fn prepare_header(size: u64, entry_type: u8) -> Header {
 }
 
 async fn prepare_header_path(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     header: &mut Header,
     path: &Path,
 ) -> io::Result<()> {
@@ -619,7 +619,7 @@ async fn prepare_header_path(
 }
 
 async fn prepare_header_link(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     header: &mut Header,
     link_name: &Path,
 ) -> io::Result<()> {
@@ -637,10 +637,10 @@ async fn prepare_header_link(
 }
 
 async fn append_fs(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     meta: &Metadata,
-    read: &mut (dyn Read + Unpin),
+    read: &mut (dyn Read + Send + Unpin),
     mode: HeaderMode,
     link_name: Option<&Path>,
 ) -> io::Result<()> {
@@ -656,7 +656,7 @@ async fn append_fs(
 }
 
 async fn append_dir_all(
-    dst: &mut (dyn Write + Unpin),
+    dst: &mut (dyn Write + Send + Unpin),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,

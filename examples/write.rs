@@ -1,6 +1,4 @@
-extern crate tar;
-
-use tar::Builder;
+use async_tar_rs::Builder;
 use tokio::fs::File;
 
 #[tokio::main]

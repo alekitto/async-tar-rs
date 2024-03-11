@@ -1,11 +1,9 @@
+use async_tar_rs::{GnuHeader, Header, HeaderMode};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 use std::{iter, mem, thread, time};
-
 use tempfile::Builder;
-
-use tar::{GnuHeader, Header, HeaderMode};
 
 #[test]
 fn default_gnu() {

@@ -2,11 +2,8 @@
 //!
 //! Takes a tarball on stdin and prints out all of the entries inside.
 
-extern crate tar;
-
+use async_tar_rs::Archive;
 use tokio::io::stdin;
-
-use tar::Archive;
 
 #[tokio::main]
 async fn main() {

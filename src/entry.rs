@@ -23,7 +23,7 @@ use crate::{Archive, Header, PaxExtensions};
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
 #[pin_project]
-pub struct Entry<'a, R: 'a + Read> {
+pub struct Entry<'a, R: 'a + Read + Send> {
     #[pin]
     fields: EntryFields<'a>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
@@ -55,7 +55,7 @@ pub struct EntryFields<'a> {
 #[pin_project(project = EntryIoProject)]
 pub enum EntryIo<'a> {
     Pad(#[pin] io::Take<io::Repeat>),
-    Data(#[pin] io::Take<&'a ArchiveInner<dyn Read + Unpin + 'a>>),
+    Data(#[pin] io::Take<&'a ArchiveInner<dyn Read + Send + Unpin + 'a>>),
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom
@@ -70,7 +70,7 @@ pub enum Unpacked {
     __Nonexhaustive,
 }
 
-impl<'a, R: Read> Entry<'a, R> {
+impl<'a, R: Read + Send> Entry<'a, R> {
     /// Returns the path name for this entry.
     ///
     /// This method may fail if the pathname is not valid Unicode and this is
@@ -288,7 +288,7 @@ impl<'a, R: Read> Entry<'a, R> {
     }
 }
 
-impl<'a, R: Read> Read for Entry<'a, R> {
+impl<'a, R: Read + Send> Read for Entry<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -300,11 +300,11 @@ impl<'a, R: Read> Read for Entry<'a, R> {
 }
 
 impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+    pub fn from<R: Read + Send>(entry: Entry<R>) -> EntryFields {
         entry.fields
     }
 
-    pub fn into_entry<R: Read>(self) -> Entry<'a, R> {
+    pub fn into_entry<R: Read + Send>(self) -> Entry<'a, R> {
         Entry {
             fields: self,
             _ignored: marker::PhantomData,

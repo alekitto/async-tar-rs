@@ -16,11 +16,11 @@ use tokio::sync::Mutex;
 /// A top-level representation of an archive file.
 ///
 /// This archive can have an entry added to it and it can be iterated over.
-pub struct Archive<R: ?Sized + Read> {
+pub struct Archive<R: ?Sized + Read + Send> {
     inner: ArchiveInner<R>,
 }
 
-pub struct ArchiveInner<R: ?Sized> {
+pub struct ArchiveInner<R: ?Sized + Send> {
     pos: AtomicU64,
     mask: u32,
     unpack_xattrs: bool,
@@ -33,23 +33,23 @@ pub struct ArchiveInner<R: ?Sized> {
 }
 
 /// An iterator over the entries of an archive.
-pub struct Entries<'a, R: 'a + Read> {
+pub struct Entries<'a, R: 'a + Read + Send> {
     fields: EntriesFields<'a>,
     _ignored: marker::PhantomData<&'a Archive<R>>,
 }
 
-trait SeekRead: Read + Seek + Unpin {}
-impl<R: Read + Seek + Unpin> SeekRead for R {}
+trait SeekRead: Read + Seek + Send + Unpin {}
+impl<R: Read + Seek + Send + Unpin> SeekRead for R {}
 
 struct EntriesFields<'a> {
-    archive: &'a Archive<dyn Read + Unpin + 'a>,
+    archive: &'a Archive<dyn Read + Send + Unpin + 'a>,
     seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
 }
 
-impl<R: Read + Unpin> Archive<R> {
+impl<R: Read + Send + Unpin> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
@@ -79,7 +79,7 @@ impl<R: Read + Unpin> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
-        let me: &mut Archive<dyn Read + Unpin> = self;
+        let me: &mut Archive<dyn Read + Send + Unpin> = self;
         me._entries(None).map(|fields| Entries {
             fields,
             _ignored: marker::PhantomData,
@@ -106,7 +106,7 @@ impl<R: Read + Unpin> Archive<R> {
     /// ar.unpack("foo").await.unwrap();
     /// ```
     pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        let me: &mut Archive<dyn Read + Unpin> = self;
+        let me: &mut Archive<dyn Read + Send + Unpin> = self;
         me._unpack(dst.as_ref()).await
     }
 
@@ -175,7 +175,7 @@ impl<R: Read + Unpin> Archive<R> {
     }
 }
 
-impl<R: Seek + Read + Unpin> Archive<R> {
+impl<R: Seek + Read + Send + Unpin> Archive<R> {
     /// Construct an iterator over the entries in this archive for a seekable
     /// reader. Seek will be used to efficiently skip over file contents.
     ///
@@ -184,7 +184,7 @@ impl<R: Seek + Read + Unpin> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
-        let me: &Archive<dyn Read + Unpin> = self;
+        let me: &Archive<dyn Read + Send + Unpin> = self;
         let me_seekable: &Archive<dyn SeekRead> = self;
         me._entries(Some(me_seekable)).map(|fields| Entries {
             fields,
@@ -193,7 +193,7 @@ impl<R: Seek + Read + Unpin> Archive<R> {
     }
 }
 
-impl Archive<dyn Read + Unpin + '_> {
+impl Archive<dyn Read + Send + Unpin + '_> {
     fn _entries<'a>(
         &'a self,
         seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
@@ -248,7 +248,7 @@ impl Archive<dyn Read + Unpin + '_> {
     }
 }
 
-impl<'a, R: Read> Entries<'a, R> {
+impl<'a, R: Read + Send> Entries<'a, R> {
     /// Indicates whether this iterator will return raw entries or not.
     ///
     /// If the raw list of entries are returned, then no preprocessing happens
@@ -573,7 +573,7 @@ impl<'a> EntriesFields<'a> {
     }
 }
 
-impl<'a, R: ?Sized + Read + Unpin> Read for &'a ArchiveInner<R> {
+impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -596,7 +596,7 @@ impl<'a, R: ?Sized + Read + Unpin> Read for &'a ArchiveInner<R> {
     }
 }
 
-impl<'a, R: ?Sized + Seek + Unpin> Seek for &'a ArchiveInner<R> {
+impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
         let Ok(inner) = self.obj.try_lock() else {
             return Err(io::Error::other("another operation is pending"));
@@ -620,7 +620,7 @@ impl<'a, R: ?Sized + Seek + Unpin> Seek for &'a ArchiveInner<R> {
 ///
 /// If the reader reaches its end before filling the buffer at all, returns `false`.
 /// Otherwise returns `true`.
-async fn try_read_all<R: Read + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+async fn try_read_all<R: Read + Send + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     let mut read = 0;
     while read < buf.len() {
         match r.read(&mut buf[read..]).await? {
