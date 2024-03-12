@@ -619,8 +619,7 @@ async fn handling_incorrect_file_size() {
     assert!(ar.unpack(td.path()).await.is_err());
 
     // Iterating
-    let rdr = ar.into_inner();
-    let mut ar = Archive::new(rdr);
+    let mut ar = Archive::new(rdr.as_slice());
     let mut entries = t!(ar.entries());
     let mut v = vec![];
     while let Some(e) = entries.next().await {

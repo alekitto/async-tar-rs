@@ -1003,15 +1003,18 @@ impl<'a> Read for EntryFields<'a> {
             }
 
             if let Some(ref mut io) = &mut *this.read_state {
+                let prev_size = buf.filled().len();
                 let ret = Pin::new(io).poll_read(cx, buf);
                 return match ret {
                     Poll::Ready(Ok(_)) => {
-                        if buf.filled().is_empty() {
+                        if buf.filled().len() - prev_size == 0 {
                             *this.read_state = None;
                             if this.data.as_ref().is_empty() {
                                 return Poll::Ready(Ok(()));
                             }
 
+                            let data = &mut *this.data;
+                            *this.read_state = Some(data.remove(0));
                             continue;
                         }
 
