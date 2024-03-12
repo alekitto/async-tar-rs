@@ -779,30 +779,30 @@ impl<'a> EntryFields<'a> {
         ) -> io::Result<()> {
             use std::os::unix::prelude::*;
 
-            let uid: libc::uid_t = uid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("UID {} is too large!", uid))
-            })?;
-            let gid: libc::gid_t = gid.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, format!("GID {} is too large!", gid))
-            })?;
+            let uid: libc::uid_t = uid
+                .try_into()
+                .map_err(|_| Error::new(ErrorKind::Other, format!("UID {} is too large!", uid)))?;
+            let gid: libc::gid_t = gid
+                .try_into()
+                .map_err(|_| Error::new(ErrorKind::Other, format!("GID {} is too large!", gid)))?;
             match f {
                 Some(f) => unsafe {
                     let fd = f.as_raw_fd();
                     if libc::fchown(fd, uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
+                        Err(Error::last_os_error())
                     } else {
                         Ok(())
                     }
                 },
                 None => unsafe {
                     let path = std::ffi::CString::new(dst.as_os_str().as_bytes()).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        Error::new(
+                            ErrorKind::Other,
                             format!("path contains null character: {:?}", e),
                         )
                     })?;
                     if libc::lchown(path.as_ptr(), uid, gid) != 0 {
-                        Err(io::Error::last_os_error())
+                        Err(Error::last_os_error())
                     } else {
                         Ok(())
                     }
@@ -856,7 +856,7 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(windows)]
-        fn _set_perms(
+        async fn _set_perms(
             dst: &Path,
             f: Option<&mut fs::File>,
             mode: u32,
@@ -882,7 +882,7 @@ impl<'a> EntryFields<'a> {
 
         #[cfg(target_arch = "wasm32")]
         #[allow(unused_variables)]
-        fn _set_perms(
+        async fn _set_perms(
             dst: &Path,
             f: Option<&mut fs::File>,
             mode: u32,
@@ -935,7 +935,7 @@ impl<'a> EntryFields<'a> {
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
         #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+        async fn set_xattrs(_: &mut EntryFields<'_>, _: &Path) -> io::Result<()> {
             Ok(())
         }
     }
