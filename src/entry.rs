@@ -202,6 +202,7 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// use async_tar_rs::Archive;
     /// use tokio::fs::File;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
     ///
     /// let mut entries = ar.entries().unwrap();
@@ -209,8 +210,9 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// while let Some(file) = entries.next().await {
     ///     i += 1;
     ///     let mut file = file.unwrap();
-    ///     file.unpack(format!("file-{}", i)).unwrap();
+    ///     file.unpack(format!("file-{}", i)).await.unwrap();
     /// }
+    /// # })
     /// ```
     pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<Unpacked> {
         self.fields.unpack(None, dst.as_ref()).await
@@ -233,13 +235,15 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// use async_tar_rs::Archive;
     /// use tokio::fs::File;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
     ///
     /// let mut entries = ar.entries().unwrap();
     /// while let Some(file) = entries.next().await {
     ///     let mut file = file.unwrap();
-    ///     file.unpack_in("target").unwrap();
+    ///     file.unpack_in("target").await.unwrap();
     /// }
+    /// # })
     /// ```
     pub async fn unpack_in<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<bool> {
         self.fields.unpack_in(dst.as_ref()).await

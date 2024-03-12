@@ -102,8 +102,10 @@ impl<R: Read + Send + Unpin> Archive<R> {
     /// use async_tar_rs::Archive;
     /// use tokio::fs::File;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
     /// ar.unpack("foo").await.unwrap();
+    /// # })
     /// ```
     pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
         let me: &mut Archive<dyn Read + Send + Unpin> = self;

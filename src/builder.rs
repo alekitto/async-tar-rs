@@ -96,6 +96,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// ```
     /// use async_tar_rs::{Builder, Header};
     ///
+    /// # tokio_test::block_on(async {
     /// let mut header = Header::new_gnu();
     /// header.set_path("foo").unwrap();
     /// header.set_size(4);
@@ -106,6 +107,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// let mut ar = Builder::new(Vec::new());
     /// ar.append(&header, data).await.unwrap();
     /// let data = ar.into_inner().await.unwrap();
+    /// # })
     /// ```
     pub async fn append<R: Read + Send + Unpin>(
         &mut self,
@@ -145,6 +147,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// ```
     /// use async_tar_rs::{Builder, Header};
     ///
+    /// # tokio_test::block_on(async {
     /// let mut header = Header::new_gnu();
     /// header.set_size(4);
     /// header.set_cksum();
@@ -156,6 +159,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     ///     .await
     ///     .unwrap();
     /// let data = ar.into_inner().await.unwrap();
+    /// })
     /// ```
     pub async fn append_data<P: AsRef<Path>, R: Read + Send + Unpin>(
         &mut self,
@@ -192,6 +196,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// ```
     /// use async_tar_rs::{Builder, Header, EntryType};
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     /// let mut header = Header::new_gnu();
     /// header.set_username("foo");
@@ -203,6 +208,7 @@ impl<W: Write + Send + Unpin> Builder<W> {
     ///     "other/really/long/target"
     /// ).await.unwrap();
     /// let data = ar.into_inner().await.unwrap();
+    /// # })
     /// ```
     pub async fn append_link<P: AsRef<Path>, T: AsRef<Path>>(
         &mut self,
@@ -246,8 +252,10 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// ```no_run
     /// use async_tar_rs::Builder;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     /// ar.append_path("foo/bar.txt").await.unwrap();
+    /// })
     /// ```
     pub async fn append_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let mode = self.mode;
@@ -277,11 +285,13 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// ```no_run
     /// use async_tar_rs::Builder;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     ///
     /// // Insert the local file "foo/bar.txt" in the archive but with the name
     /// // "bar/foo.txt".
     /// ar.append_path_with_name("foo/bar.txt", "bar/foo.txt").await.unwrap();
+    /// # })
     /// ```
     pub async fn append_path_with_name<P: AsRef<Path>, N: AsRef<Path>>(
         &mut self,
@@ -317,14 +327,16 @@ impl<W: Write + Send + Unpin> Builder<W> {
     ///
     /// ```no_run
     /// use async_tar_rs::Builder;
-    /// use tokio::fs::File;    ///
+    /// use tokio::fs::File;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     ///
     /// // Open the file at one location, but insert it into the archive with a
     /// // different name.
     /// let mut f = File::open("foo/bar/baz.txt").await.unwrap();
     /// ar.append_file("bar/baz.txt", &mut f).await.unwrap();
+    /// # })
     /// ```
     pub async fn append_file<P: AsRef<Path>>(
         &mut self,
@@ -357,11 +369,13 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// use async_tar_rs::Builder;
     /// use tokio::fs;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     ///
     /// // Use the directory at one location, but insert it into the archive
     /// // with a different name.
     /// ar.append_dir("bardir", ".").await.unwrap();
+    /// # })
     /// ```
     pub async fn append_dir<P, Q>(&mut self, path: P, src_path: Q) -> io::Result<()>
     where
@@ -388,11 +402,13 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// use async_tar_rs::Builder;
     /// use tokio::fs;
     ///
+    /// # tokio_test::block_on(async {
     /// let mut ar = Builder::new(Vec::new());
     ///
     /// // Use the directory at one location, but insert it into the archive
     /// // with a different name.
     /// ar.append_dir_all("bardir", ".").await.unwrap();
+    /// # })
     /// ```
     pub async fn append_dir_all<P, Q>(&mut self, path: P, src_path: Q) -> io::Result<()>
     where
