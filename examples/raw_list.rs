@@ -4,6 +4,7 @@
 
 use async_tar_rs::Archive;
 use tokio::io::stdin;
+use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() {

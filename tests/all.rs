@@ -11,6 +11,7 @@ use tokio::fs::{self, File};
 use tokio::io::{
     self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
+use tokio_stream::StreamExt;
 
 macro_rules! t {
     ($e:expr) => {

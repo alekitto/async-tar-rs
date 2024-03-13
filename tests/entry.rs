@@ -2,6 +2,7 @@ use tokio::fs::{create_dir, File};
 
 use tempfile::Builder;
 use tokio::io::AsyncReadExt;
+use tokio_stream::StreamExt;
 
 macro_rules! t {
     ($e:expr) => {

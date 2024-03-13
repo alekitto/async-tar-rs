@@ -1,17 +1,21 @@
+use futures_core::Stream;
+use pin_project::pin_project;
+use std::io::SeekFrom;
+use std::path::Path;
+use std::pin::{pin, Pin};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::{cmp, marker};
+use tokio::fs;
+use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, ReadBuf};
+use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
+
 use crate::entry::{EntryFields, EntryIo};
 use crate::error::TarError;
 use crate::other;
 use crate::pax::*;
 use crate::{Entry, GnuExtSparseHeader, GnuSparseHeader, Header};
-use std::io::SeekFrom;
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
-use std::{cmp, marker};
-use tokio::fs;
-use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, AsyncSeekExt, ReadBuf};
-use tokio::sync::Mutex;
 
 /// A top-level representation of an archive file.
 ///
@@ -41,12 +45,18 @@ pub struct Entries<'a, R: 'a + Read + Send> {
 trait SeekRead: Read + Seek + Send + Unpin {}
 impl<R: Read + Seek + Send + Unpin> SeekRead for R {}
 
+#[pin_project]
 struct EntriesFields<'a> {
     archive: &'a Archive<dyn Read + Send + Unpin + 'a>,
     seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
+    #[pin]
+    fields: Option<EntryFields<'a>>,
+    gnu_longname: Option<Vec<u8>>,
+    gnu_longlink: Option<Vec<u8>>,
+    pax_extensions: Option<Vec<u8>>,
 }
 
 impl<R: Read + Send + Unpin> Archive<R> {
@@ -212,6 +222,10 @@ impl Archive<dyn Read + Send + Unpin + '_> {
             done: false,
             next: 0,
             raw: false,
+            fields: None,
+            gnu_longname: None,
+            gnu_longlink: None,
+            pax_extensions: None,
         })
     }
 
@@ -262,32 +276,43 @@ impl<'a, R: Read + Send> Entries<'a, R> {
             _ignored: marker::PhantomData,
         }
     }
+}
+
+impl<'a, R: Read + Send> Stream for Entries<'a, R> {
+    type Item = io::Result<Entry<'a, R>>;
 
     /// Get the next entry, if one.
     /// This replaces the iterator interface, and it's simpler than implementing Stream.
-    pub async fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
-        self.fields
-            .next()
-            .await
-            .map(|result| result.map(|e| EntryFields::from(e).into_entry()))
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(
+            match futures_core::ready!(Pin::new(&mut self.fields).poll_next(cx)) {
+                Some(result) => Some(result.map(|e| EntryFields::from(e).into_entry())),
+                None => None,
+            },
+        )
     }
 }
 
 impl<'a> EntriesFields<'a> {
-    async fn next_entry_raw(
+    fn poll_next_entry_raw(
         &mut self,
         pax_extensions: Option<&[u8]>,
-    ) -> io::Result<Option<Entry<'a, io::Empty>>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Entry<'a, io::Empty>>>> {
         let mut header = Header::new_old();
         let mut header_pos = self.next;
         loop {
             // Seek to the start of the next header in the archive
             let delta = self.next - self.archive.inner.pos.load(Ordering::SeqCst);
-            self.skip(delta).await?;
+            futures_core::ready!(self.poll_skip(delta, cx))?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !try_read_all(&mut &self.archive.inner, header.as_mut_bytes()).await? {
-                return Ok(None);
+            if !futures_core::ready!(poll_try_read_all(
+                &mut &self.archive.inner,
+                cx,
+                &mut ReadBuf::new(header.as_mut_bytes())
+            ))? {
+                return Poll::Ready(Ok(None));
             }
 
             // If a header is not all zeros, we have another valid header.
@@ -299,7 +324,7 @@ impl<'a> EntriesFields<'a> {
             }
 
             if !self.archive.inner.ignore_zeros {
-                return Ok(None);
+                return Poll::Ready(Ok(None));
             }
             self.next += 512;
             header_pos = self.next;
@@ -313,7 +338,7 @@ impl<'a> EntriesFields<'a> {
             + 8 * 32;
         let cksum = header.cksum()?;
         if sum != cksum {
-            return Err(other("archive header checksum mismatch"));
+            return Poll::Ready(Err(other("archive header checksum mismatch")));
         }
 
         let mut pax_size: Option<u64> = None;
@@ -364,83 +389,108 @@ impl<'a> EntriesFields<'a> {
             .checked_add(size & !(512 - 1))
             .ok_or_else(|| other("size overflow"))?;
 
-        Ok(Some(ret.into_entry()))
+        Poll::Ready(Ok(Some(ret.into_entry())))
     }
 
-    async fn next_entry(&mut self) -> io::Result<Option<Entry<'a, io::Empty>>> {
+    fn poll_next_entry(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Entry<'a, io::Empty>>>> {
         if self.raw {
-            return self.next_entry_raw(None).await;
+            return self.poll_next_entry_raw(None, cx);
         }
 
-        let mut gnu_longname = None;
-        let mut gnu_longlink = None;
-        let mut pax_extensions = None;
         let mut processed = 0;
         loop {
-            processed += 1;
-            let entry = match self.next_entry_raw(pax_extensions.as_deref()).await? {
-                Some(entry) => entry,
-                None if processed > 1 => {
-                    return Err(other(
-                        "members found describing a future member \
-                         but no future member found",
-                    ));
-                }
-                None => return Ok(None),
+            let fields = if let Some(fields) = self.fields.as_mut() {
+                fields
+            } else {
+                processed += 1;
+                let pax_extensions = self.pax_extensions.clone();
+                self.fields = match futures_core::ready!(
+                    self.poll_next_entry_raw(pax_extensions.as_deref(), cx)
+                )? {
+                    Some(entry) => Some(EntryFields::from(entry)),
+                    None if processed > 1 => {
+                        return Poll::Ready(Err(other(
+                            "members found describing a future member but no future member found",
+                        )));
+                    }
+                    None => return Poll::Ready(Ok(None)),
+                };
+                continue;
             };
 
             let is_recognized_header =
-                entry.header().as_gnu().is_some() || entry.header().as_ustar().is_some();
+                fields.header.as_gnu().is_some() || fields.header.as_ustar().is_some();
 
-            if is_recognized_header && entry.header().entry_type().is_gnu_longname() {
-                if gnu_longname.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_gnu_longname() {
+                if fields.long_pathname.is_some() {
+                    return Poll::Ready(Err(other(
                         "two long name entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                gnu_longname = Some(EntryFields::from(entry).read_all().await?);
+
+                self.gnu_longname = Some(futures_core::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_gnu_longlink() {
-                if gnu_longlink.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_gnu_longlink() {
+                if fields.long_linkname.is_some() {
+                    return Poll::Ready(Err(other(
                         "two long name entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                gnu_longlink = Some(EntryFields::from(entry).read_all().await?);
+
+                self.gnu_longlink = Some(futures_core::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_pax_local_extensions() {
-                if pax_extensions.is_some() {
-                    return Err(other(
+            if is_recognized_header && fields.header.entry_type().is_pax_local_extensions() {
+                if fields.pax_extensions.is_some() {
+                    return Poll::Ready(Err(other(
                         "two pax extensions entries describing \
                          the same member",
-                    ));
+                    )));
                 }
-                pax_extensions = Some(EntryFields::from(entry).read_all().await?);
+
+                self.pax_extensions =
+                    Some(futures_core::ready!(Pin::new(fields).poll_read_all(cx))?);
+                self.fields = None;
                 continue;
             }
 
-            let mut fields = EntryFields::from(entry);
-            fields.long_pathname = gnu_longname;
-            fields.long_linkname = gnu_longlink;
-            fields.pax_extensions = pax_extensions;
-            self.parse_sparse_header(&mut fields).await?;
-            return Ok(Some(fields.into_entry()));
+            futures_core::ready!(Self::poll_parse_sparse_header(
+                &mut self.next,
+                self.archive,
+                fields,
+                cx
+            ))?;
+
+            fields.long_pathname = self.gnu_longname.take();
+            fields.long_linkname = self.gnu_longlink.take();
+            fields.pax_extensions = self.pax_extensions.take();
+
+            return Poll::Ready(Ok(Some(self.fields.take().unwrap().into_entry())));
         }
     }
 
-    async fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a>) -> io::Result<()> {
+    fn poll_parse_sparse_header(
+        next: &mut u64,
+        archive: &'a Archive<dyn Read + Send + Unpin + 'a>,
+        entry: &mut EntryFields<'a>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         if !entry.header.entry_type().is_gnu_sparse() {
-            return Ok(());
+            return Poll::Ready(Ok(()));
         }
         let gnu = match entry.header.as_gnu() {
             Some(gnu) => gnu,
-            None => return Err(other("sparse entry type listed but not GNU header")),
+            None => return Poll::Ready(Err(other("sparse entry type listed but not GNU header"))),
         };
 
         // Sparse files are represented internally as a list of blocks that are
@@ -468,7 +518,7 @@ impl<'a> EntriesFields<'a> {
         let mut remaining = entry.size;
         {
             let data = &mut entry.data;
-            let reader = &self.archive.inner;
+            let reader = &archive.inner;
             let size = entry.size;
             let mut add_block = |block: &GnuSparseHeader| -> io::Result<_> {
                 if block.is_empty() {
@@ -509,11 +559,15 @@ impl<'a> EntriesFields<'a> {
                 let mut ext = GnuExtSparseHeader::new();
                 ext.isextended[0] = 1;
                 while ext.is_extended() {
-                    if !try_read_all(&mut &self.archive.inner, ext.as_mut_bytes()).await? {
-                        return Err(other("failed to read extension"));
+                    if !futures_core::ready!(poll_try_read_all(
+                        &mut &archive.inner,
+                        cx,
+                        &mut ReadBuf::new(ext.as_mut_bytes())
+                    ))? {
+                        return Poll::Ready(Err(other("failed to read extension")));
                     }
 
-                    self.next += 512;
+                    *next += 512;
                     for block in ext.sparse.iter() {
                         add_block(block)?;
                     }
@@ -521,54 +575,73 @@ impl<'a> EntriesFields<'a> {
             }
         }
         if cur != gnu.real_size()? {
-            return Err(other(
+            return Poll::Ready(Err(other(
                 "mismatch in sparse file chunks and \
                  size in header",
-            ));
+            )));
         }
         entry.size = cur;
         if remaining > 0 {
-            return Err(other(
+            return Poll::Ready(Err(other(
                 "mismatch in sparse file chunks and \
                  entry size in header",
-            ));
+            )));
         }
-        Ok(())
+
+        Poll::Ready(Ok(()))
     }
 
-    async fn skip(&mut self, mut amt: u64) -> io::Result<()> {
+    fn poll_skip(&mut self, amt: u64, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         if let Some(seekable_archive) = self.seekable_archive {
-            let pos = io::SeekFrom::Current(
+            let _ = futures_core::ready!(pin!(&seekable_archive.inner).poll_complete(cx));
+
+            let pos = SeekFrom::Current(
                 i64::try_from(amt).map_err(|_| other("seek position out of bounds"))?,
             );
-            (&seekable_archive.inner).seek(pos).await?;
-        } else {
-            let mut buf = [0u8; 4096 * 8];
-            while amt > 0 {
-                let n = cmp::min(amt, buf.len() as u64);
-                let n = (&self.archive.inner).read(&mut buf[..n as usize]).await?;
-                if n == 0 {
-                    return Err(other("unexpected EOF during skip"));
-                }
-                amt -= n as u64;
-            }
-        }
-        Ok(())
-    }
 
-    async fn next(&mut self) -> Option<io::Result<Entry<'a, io::Empty>>> {
-        if self.done {
-            None
+            match pin!(&seekable_archive.inner).start_seek(pos) {
+                Ok(_) => pin!(&seekable_archive.inner).poll_complete(cx),
+                Err(e) => Poll::Ready(Err(e)),
+            }
         } else {
-            match self.next_entry().await {
-                Ok(Some(e)) => Some(Ok(e)),
+            let mut rem = amt;
+            let mut buf = [0u8; 4096 * 8];
+            while rem > 0 {
+                let n = cmp::min(amt, buf.len() as u64);
+                let mut buf = ReadBuf::new(&mut buf[..n as usize]);
+                match futures_core::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
+                    Ok(_) => {
+                        let n = buf.filled().len();
+                        if n == 0 {
+                            return Poll::Ready(Err(other("unexpected EOF during skip")));
+                        }
+                        rem -= n as u64;
+                    }
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+
+            Poll::Ready(Ok(amt))
+        }
+    }
+}
+
+impl<'a> Stream for EntriesFields<'a> {
+    type Item = io::Result<Entry<'a, io::Empty>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            Poll::Ready(None)
+        } else {
+            match futures_core::ready!(self.poll_next_entry(cx)) {
+                Ok(Some(e)) => Poll::Ready(Some(Ok(e))),
                 Ok(None) => {
                     self.done = true;
-                    None
+                    Poll::Ready(None)
                 }
                 Err(e) => {
                     self.done = true;
-                    Some(Err(e))
+                    Poll::Ready(Some(Err(e)))
                 }
             }
         }
@@ -580,7 +653,7 @@ impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let Ok(inner) = self.obj.try_lock() else {
             return Poll::Pending;
         };
@@ -599,7 +672,7 @@ impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
 }
 
 impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
-    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         let Ok(inner) = self.obj.try_lock() else {
             return Err(io::Error::other("another operation is pending"));
         };
@@ -608,7 +681,7 @@ impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
         pinned.as_mut().start_seek(position)
     }
 
-    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         if let Ok(inner) = self.obj.try_lock() {
             let mut pinned = Pin::new(inner);
             Poll::Ready(futures_core::ready!(pinned.as_mut().poll_complete(cx)))
@@ -621,20 +694,24 @@ impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
 /// Try to fill the buffer from the reader.
 ///
 /// If the reader reaches its end before filling the buffer at all, returns `false`.
-/// Otherwise returns `true`.
-async fn try_read_all<R: Read + Send + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
-    let mut read = 0;
-    while read < buf.len() {
-        match r.read(&mut buf[read..]).await? {
-            0 => {
-                if read == 0 {
-                    return Ok(false);
-                }
-
-                return Err(other("failed to read entire block"));
-            }
-            n => read += n,
-        }
+/// Otherwise, returns `true`.
+fn poll_try_read_all<R: Read + Send + Unpin>(
+    r: &mut R,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<bool>> {
+    let prev_read = buf.filled().len();
+    if let Err(e) = futures_core::ready!(pin!(r).poll_read(cx, buf)) {
+        return Poll::Ready(Err(e));
     }
-    Ok(true)
+
+    if buf.filled().len() == prev_read {
+        if prev_read == 0 {
+            Poll::Ready(Ok(false))
+        } else {
+            Poll::Ready(Err(other("failed to read entire block")))
+        }
+    } else {
+        Poll::Ready(Ok(true))
+    }
 }

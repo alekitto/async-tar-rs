@@ -7,6 +7,7 @@
 use std::env::args_os;
 use std::path::Path;
 use tokio::io::{copy, stdin, stdout};
+use tokio_stream::StreamExt;
 
 use async_tar_rs::Archive;
 

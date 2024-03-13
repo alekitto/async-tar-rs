@@ -23,6 +23,7 @@ filetime = "0.2.8"
 futures-core = "0.3"
 pin-project = "1.1"
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "sync"] }
+tokio-stream = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -35,4 +36,4 @@ libc = "0.2"
 
 [features]
 default = ["tokio", "xattr"]
-tokio = ["dep:tokio"]
+tokio = ["dep:tokio", "dep:tokio-stream"]

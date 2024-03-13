@@ -201,6 +201,7 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// ```no_run
     /// use async_tar_rs::Archive;
     /// use tokio::fs::File;
+    /// use tokio_stream::StreamExt;
     ///
     /// # tokio_test::block_on(async {
     /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
@@ -234,6 +235,7 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// ```no_run
     /// use async_tar_rs::Archive;
     /// use tokio::fs::File;
+    /// use tokio_stream::StreamExt;
     ///
     /// # tokio_test::block_on(async {
     /// let mut ar = Archive::new(File::open("foo.tar").await.unwrap());
@@ -297,7 +299,7 @@ impl<'a, R: Read + Send> Read for Entry<'a, R> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let mut this = self.project();
         Pin::new(&mut *this.fields).poll_read(cx, buf)
     }
@@ -320,6 +322,20 @@ impl<'a> EntryFields<'a> {
         let cap = cmp::min(self.size, 128 * 1024);
         let mut v = Vec::with_capacity(cap as usize);
         self.read_to_end(&mut v).await.map(|_| v)
+    }
+
+    pub(crate) fn poll_read_all(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<io::Result<Vec<u8>>> {
+        // Preallocate some data but don't let ourselves get too crazy now.
+        let cap = cmp::min(self.size, 128 * 1024);
+        let mut v = Vec::with_capacity(cap as usize);
+
+        match futures_core::ready!(poll_read_all_internal(self, cx, &mut v)) {
+            Ok(_) => Poll::Ready(Ok(v)),
+            Err(err) => Poll::Ready(Err(err)),
+        }
     }
 
     fn path(&self) -> io::Result<Cow<Path>> {
@@ -961,7 +977,7 @@ impl<'a> EntryFields<'a> {
     }
 
     fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
-        // Abort if target (canonical) parent is outside of `dst`
+        // Abort if target (canonical) parent is outside `dst`
         let canon_parent = file_dst.canonicalize().map_err(|err| {
             Error::new(
                 err.kind(),
@@ -994,7 +1010,7 @@ impl<'a> Read for EntryFields<'a> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
             if this.read_state.is_none() {
@@ -1040,10 +1056,62 @@ impl<'a> Read for EntryIo<'a> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         match self.project() {
             EntryIoProject::Pad(io) => io.poll_read(cx, buf),
             EntryIoProject::Data(io) => io.poll_read(cx, buf),
         }
     }
+}
+
+struct Guard<'a> {
+    buf: &'a mut Vec<u8>,
+    len: usize,
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.buf.set_len(self.len);
+        }
+    }
+}
+
+fn poll_read_all_internal<R: Read + ?Sized>(
+    mut rd: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    buf: &mut Vec<u8>,
+) -> Poll<io::Result<usize>> {
+    let mut g = Guard {
+        len: buf.len(),
+        buf,
+    };
+    let ret;
+    loop {
+        if g.len == g.buf.len() {
+            unsafe {
+                g.buf.reserve(32);
+                let capacity = g.buf.capacity();
+                g.buf.set_len(capacity);
+
+                let buf = &mut g.buf[g.len..];
+                std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
+            }
+        }
+
+        let mut read_buf = io::ReadBuf::new(&mut g.buf[g.len..]);
+        match futures_core::ready!(rd.as_mut().poll_read(cx, &mut read_buf)) {
+            Ok(()) if read_buf.filled().is_empty() => {
+                ret = Poll::Ready(Ok(g.len));
+                break;
+            }
+            Ok(()) => g.len += read_buf.filled().len(),
+            Err(e) => {
+                ret = Poll::Ready(Err(e));
+                break;
+            }
+        }
+    }
+
+    ret
 }
