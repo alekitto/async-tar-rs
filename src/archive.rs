@@ -1,3 +1,10 @@
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs,
+    io::{self, Read, ReadExt, Seek},
+    stream::StreamExt,
+    sync::Mutex,
+};
 use futures_core::Stream;
 use pin_project::pin_project;
 use std::io::SeekFrom;
@@ -6,9 +13,13 @@ use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::{cmp, marker};
-use tokio::fs;
-use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, ReadBuf};
-use tokio::sync::Mutex;
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs,
+    io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, ReadBuf},
+    sync::Mutex,
+};
+#[cfg(feature = "tokio")]
 use tokio_stream::StreamExt;
 
 use crate::entry::{EntryFields, EntryIo};
@@ -33,6 +44,7 @@ pub struct ArchiveInner<R: ?Sized + Send> {
     preserve_mtime: bool,
     overwrite: bool,
     ignore_zeros: bool,
+    buf: Mutex<Vec<u8>>,
     obj: Mutex<R>,
 }
 
@@ -73,6 +85,7 @@ impl<R: Read + Send + Unpin> Archive<R> {
                 ignore_zeros: false,
                 obj: Mutex::new(obj),
                 pos: AtomicU64::new(0),
+                buf: Default::default(),
             },
         }
     }
@@ -109,7 +122,10 @@ impl<R: Read + Send + Unpin> Archive<R> {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "async-std")]
+    /// # use async_std::fs::File;
     /// use async_tar_rs::Archive;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio::fs::File;
     ///
     /// # tokio_test::block_on(async {
@@ -307,10 +323,10 @@ impl<'a> EntriesFields<'a> {
             futures_core::ready!(self.poll_skip(delta, cx))?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !futures_core::ready!(poll_try_read_all(
-                &mut &self.archive.inner,
+            if !futures_core::ready!(pin!(&self.archive.inner).poll_try_read_all(
                 cx,
-                &mut ReadBuf::new(header.as_mut_bytes())
+                header.as_mut_bytes(),
+                false
             ))? {
                 return Poll::Ready(Ok(None));
             }
@@ -559,10 +575,10 @@ impl<'a> EntriesFields<'a> {
                 let mut ext = GnuExtSparseHeader::new();
                 ext.isextended[0] = 1;
                 while ext.is_extended() {
-                    if !futures_core::ready!(poll_try_read_all(
-                        &mut &archive.inner,
+                    if !futures_core::ready!(pin!(&archive.inner).poll_try_read_all(
                         cx,
-                        &mut ReadBuf::new(ext.as_mut_bytes())
+                        ext.as_mut_bytes(),
+                        true
                     ))? {
                         return Poll::Ready(Err(other("failed to read extension")));
                     }
@@ -593,31 +609,53 @@ impl<'a> EntriesFields<'a> {
 
     fn poll_skip(&mut self, amt: u64, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         if let Some(seekable_archive) = self.seekable_archive {
+            #[cfg(feature = "tokio")]
             let _ = futures_core::ready!(pin!(&seekable_archive.inner).poll_complete(cx));
-
             let pos = SeekFrom::Current(
                 i64::try_from(amt).map_err(|_| other("seek position out of bounds"))?,
             );
 
+            #[cfg(feature = "tokio")]
             match pin!(&seekable_archive.inner).start_seek(pos) {
                 Ok(_) => pin!(&seekable_archive.inner).poll_complete(cx),
                 Err(e) => Poll::Ready(Err(e)),
             }
+
+            #[cfg(feature = "async-std")]
+            pin!(&seekable_archive.inner).poll_seek(cx, pos)
         } else {
             let mut rem = amt;
             let mut buf = [0u8; 4096 * 8];
             while rem > 0 {
                 let n = cmp::min(amt, buf.len() as u64);
-                let mut buf = ReadBuf::new(&mut buf[..n as usize]);
-                match futures_core::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
-                    Ok(_) => {
-                        let n = buf.filled().len();
-                        if n == 0 {
-                            return Poll::Ready(Err(other("unexpected EOF during skip")));
+                #[cfg(feature = "tokio")]
+                {
+                    let mut buf = ReadBuf::new(&mut buf[..n as usize]);
+                    match futures_core::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
+                        Ok(_) => {
+                            let n = buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Err(other("unexpected EOF during skip")));
+                            }
+                            rem -= n as u64;
                         }
-                        rem -= n as u64;
+                        Err(e) => return Poll::Ready(Err(e)),
                     }
-                    Err(e) => return Poll::Ready(Err(e)),
+                }
+
+                #[cfg(feature = "async-std")]
+                {
+                    let mut buf = &mut buf[..n as usize];
+                    match futures_core::ready!(pin!(&self.archive.inner).poll_read(cx, &mut buf)) {
+                        Ok(n) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(other("unexpected EOF during skip")));
+                            }
+
+                            rem -= n as u64;
+                        }
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
                 }
             }
 
@@ -648,6 +686,7 @@ impl<'a> Stream for EntriesFields<'a> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -671,6 +710,30 @@ impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
     }
 }
 
+#[cfg(feature = "async-std")]
+impl<'a, R: ?Sized + Read + Send + Unpin> Read for &'a ArchiveInner<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let Some(inner) = self.obj.try_lock() else {
+            return Poll::Pending;
+        };
+
+        let mut pinned = Pin::new(inner);
+        let res = futures_core::ready!(pinned.as_mut().poll_read(cx, buf));
+        match res {
+            Ok(n) => {
+                self.pos.fetch_add(n as u64, Ordering::SeqCst);
+                Poll::Ready(Ok(n))
+            }
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         let Ok(inner) = self.obj.try_lock() else {
@@ -691,27 +754,121 @@ impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
     }
 }
 
-/// Try to fill the buffer from the reader.
-///
-/// If the reader reaches its end before filling the buffer at all, returns `false`.
-/// Otherwise, returns `true`.
-fn poll_try_read_all<R: Read + Send + Unpin>(
-    r: &mut R,
-    cx: &mut Context<'_>,
-    buf: &mut ReadBuf<'_>,
-) -> Poll<io::Result<bool>> {
-    let prev_read = buf.filled().len();
-    if let Err(e) = futures_core::ready!(pin!(r).poll_read(cx, buf)) {
-        return Poll::Ready(Err(e));
+#[cfg(feature = "async-std")]
+impl<'a, R: ?Sized + Seek + Send + Unpin> Seek for &'a ArchiveInner<R> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<std::io::Result<u64>> {
+        let Some(inner) = self.obj.try_lock() else {
+            return Poll::Ready(Err(io::Error::other("another operation is pending")));
+        };
+
+        let mut pinned = Pin::new(inner);
+        pinned.as_mut().poll_seek(cx, pos)
+    }
+}
+
+impl<R: ?Sized + Read + Send + Unpin> ArchiveInner<R> {
+    /// Try to fill the buffer from the reader.
+    ///
+    /// If the reader reaches its end before filling the buffer at all, returns `false`.
+    /// Otherwise, returns `true`.
+    #[cfg(feature = "tokio")]
+    fn poll_try_read_all(
+        mut self: Pin<&mut &Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        buffered: bool,
+    ) -> Poll<io::Result<bool>> {
+        let Ok(mut sbuf) = self.buf.try_lock() else {
+            return Poll::Pending;
+        };
+
+        if !buffered {
+            sbuf.clear();
+        }
+
+        let mut t = [0; 512];
+        let rem = buf.len() - sbuf.len();
+        let mut b = ReadBuf::new(&mut t[..rem]);
+
+        if let Err(e) = futures_core::ready!(self.as_mut().poll_read(cx, &mut b)) {
+            return Poll::Ready(Err(e));
+        }
+
+        if b.filled().len() == 0 {
+            if sbuf.len() == 0 {
+                Poll::Ready(Ok(false))
+            } else {
+                Poll::Ready(Err(other("failed to read entire block")))
+            }
+        } else if b.filled().len() == rem {
+            let b = b.filled_mut();
+            if !sbuf.is_empty() {
+                buf.copy_from_slice(sbuf.drain(..).as_slice());
+                buf[rem..].copy_from_slice(b);
+            } else {
+                buf.copy_from_slice(b);
+            }
+
+            Poll::Ready(Ok(true))
+        } else {
+            sbuf.append(&mut b.filled().to_vec());
+            Poll::Pending
+        }
     }
 
-    if buf.filled().len() == prev_read {
-        if prev_read == 0 {
-            Poll::Ready(Ok(false))
-        } else {
-            Poll::Ready(Err(other("failed to read entire block")))
+    /// Try to fill the buffer from the reader.
+    ///
+    /// If the reader reaches its end before filling the buffer at all, returns `false`.
+    /// Otherwise, returns `true`.
+    #[cfg(feature = "async-std")]
+    fn poll_try_read_all(
+        mut self: Pin<&mut &Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        buffered: bool,
+    ) -> Poll<io::Result<bool>> {
+        let Some(mut sbuf) = self.buf.try_lock() else {
+            return Poll::Pending;
+        };
+
+        if !buffered {
+            sbuf.clear();
         }
-    } else {
-        Poll::Ready(Ok(true))
+
+        let mut t = [0; 512];
+        let rem = buf.len() - sbuf.len();
+        let b = &mut t[..rem];
+
+        match futures_core::ready!(self.as_mut().poll_read(cx, b)) {
+            Err(e) => {
+                return Poll::Ready(Err(e));
+            }
+            Ok(0) => {
+                if sbuf.len() == 0 {
+                    Poll::Ready(Ok(false))
+                } else {
+                    Poll::Ready(Err(other("failed to read entire block")))
+                }
+            }
+            Ok(n) => {
+                if n == rem {
+                    if !sbuf.is_empty() {
+                        buf.copy_from_slice(sbuf.drain(..).as_slice());
+                        buf[rem..].copy_from_slice(b);
+                    } else {
+                        buf.copy_from_slice(b);
+                    }
+
+                    Poll::Ready(Ok(true))
+                } else {
+                    sbuf.append(&mut b.to_vec());
+                    Poll::Pending
+                }
+            }
+        }
     }
 }

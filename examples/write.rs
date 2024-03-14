@@ -1,4 +1,7 @@
+#[cfg(feature = "async-std")]
+use async_std::fs::File;
 use async_tar_rs::Builder;
+#[cfg(feature = "tokio")]
 use tokio::fs::File;
 
 #[tokio::main]

@@ -19,9 +19,10 @@ contents are never required to be entirely resident in memory all at once.
 """
 
 [dependencies]
-filetime = "0.2.8"
+async-std = { version = "1", optional = true }
+filetime = "0.2"
 futures-core = "0.3"
-pin-project = "1.1"
+pin-project = "1"
 tokio = { version = "1", optional = true, features = ["fs", "io-util", "sync"] }
 tokio-stream = { version = "0.1", optional = true }
 
@@ -31,9 +32,10 @@ tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "rt-mu
 tokio-test = "0.4"
 
 [target."cfg(unix)".dependencies]
-xattr = { version = "1.0", optional = true }
 libc = "0.2"
+xattr = { version = "1.0", optional = true }
 
 [features]
 default = ["tokio", "xattr"]
+async-std = ["dep:async-std"]
 tokio = ["dep:tokio", "dep:tokio-stream"]

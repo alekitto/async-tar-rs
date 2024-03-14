@@ -1,16 +1,29 @@
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs::{self, File},
+    io::{self, Cursor, Read, ReadExt, Seek, Write, WriteExt},
+    stream::StreamExt,
+};
 use async_tar_rs::{Archive, Builder, Entries, EntryType, Header, HeaderMode};
 use filetime::FileTime;
 use pin_project::pin_project;
-use std::io::{Cursor, SeekFrom};
+#[cfg(feature = "tokio")]
+use std::io::Cursor;
+use std::io::SeekFrom;
 use std::iter::repeat;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tempfile::{Builder as TempBuilder, TempDir};
-use tokio::fs::{self, File};
-use tokio::io::{
-    self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, AsyncWrite, AsyncWriteExt, ReadBuf,
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs::{self, File},
+    io::{
+        self, AsyncRead as Read, AsyncReadExt, AsyncSeek as Seek, AsyncWrite as Write,
+        AsyncWriteExt, ReadBuf,
+    },
 };
+#[cfg(feature = "tokio")]
 use tokio_stream::StreamExt;
 
 macro_rules! t {
@@ -258,12 +271,13 @@ impl<R> LoggingReader<R> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl<T: Read> Read for LoggingReader<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let this = self.project();
         match this.inner.poll_read(cx, buf) {
             Poll::Ready(Ok(_)) => {
@@ -275,15 +289,46 @@ impl<T: Read> Read for LoggingReader<T> {
     }
 }
 
+#[cfg(feature = "async-std")]
+impl<T: Read> Read for LoggingReader<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.project();
+        match this.inner.poll_read(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                *this.read_bytes += n as u64;
+                Poll::Ready(Ok(n))
+            }
+            res @ _ => res,
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl<T: Seek> Seek for LoggingReader<T> {
-    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
+    fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         let this = self.project();
         this.inner.start_seek(position)
     }
 
-    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         let this = self.project();
         this.inner.poll_complete(cx)
+    }
+}
+
+#[cfg(feature = "async-std")]
+impl<T: Seek> Seek for LoggingReader<T> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
+        let this = self.project();
+        this.inner.poll_seek(cx, pos)
     }
 }
 
@@ -638,7 +683,7 @@ async fn extracting_malicious_tarball() {
 
     {
         let mut a = Builder::new(&mut evil_tar);
-        async fn append<T: AsyncWrite + Send + Unpin>(a: &mut Builder<T>, path: &str) {
+        async fn append<T: Write + Send + Unpin>(a: &mut Builder<T>, path: &str) {
             let mut header = Header::new_gnu();
             assert!(header.set_path(path).is_err(), "was ok: {:?}", path);
             {
@@ -787,11 +832,11 @@ async fn extracting_malformed_tar_null_blocks() {
 }
 
 #[tokio::test]
-async fn empty_filename() {
+async fn empty_filename() -> io::Result<()> {
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let rdr = tar!("empty_filename.tar");
     let mut ar = Archive::new(rdr);
-    assert!(ar.unpack(td.path()).await.is_ok());
+    ar.unpack(td.path()).await
 }
 
 #[tokio::test]
@@ -941,7 +986,7 @@ async fn unpack_links() {
 
     assert_eq!(
         &*t!(fs::read_link(td.path().join("lnk")).await),
-        Path::new("file")
+        Path::new("file").as_os_str()
     );
     t!(File::open(td.path().join("lnk")).await);
 }
@@ -1422,7 +1467,14 @@ async fn insert_local_file_different_name() {
     assert_eq!(t!(entry.path()), Path::new("archive/dir"));
     let entry = t!(entries.next().await.unwrap());
     assert_eq!(t!(entry.path()), Path::new("archive/dir/f"));
-    assert!(entries.next().await.is_none());
+    let next = entries.next().await;
+    if let Some(n) = &next {
+        if let Err(e) = n {
+            println!("{:#?}", e);
+        }
+        println!("ERR");
+    }
+    assert!(next.is_none());
 }
 
 #[tokio::test]

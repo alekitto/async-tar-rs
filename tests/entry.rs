@@ -1,7 +1,16 @@
-use tokio::fs::{create_dir, File};
-
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs::{create_dir, File},
+    io::ReadExt,
+    stream::StreamExt,
+};
 use tempfile::Builder;
-use tokio::io::AsyncReadExt;
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs::{create_dir, File},
+    io::AsyncReadExt,
+};
+#[cfg(feature = "tokio")]
 use tokio_stream::StreamExt;
 
 macro_rules! t {

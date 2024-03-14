@@ -4,9 +4,16 @@
 //! name as the first argument provided, and then prints the contents of that
 //! file to stdout.
 
+#[cfg(feature = "async-std")]
+use async_std::{
+    io::{copy, stdin, stdout},
+    stream::StreamExt,
+};
 use std::env::args_os;
 use std::path::Path;
+#[cfg(feature = "tokio")]
 use tokio::io::{copy, stdin, stdout};
+#[cfg(feature = "tokio")]
 use tokio_stream::StreamExt;
 
 use async_tar_rs::Archive;

@@ -1,3 +1,8 @@
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs::{self, OpenOptions},
+    io::{self, prelude::SeekExt, Read, ReadExt},
+};
 use filetime::FileTime;
 use pin_project::pin_project;
 use std::borrow::Cow;
@@ -8,8 +13,11 @@ use std::marker;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::fs::{self, OpenOptions};
-use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt, ReadBuf};
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs::{self, OpenOptions},
+    io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt, ReadBuf},
+};
 
 use crate::archive::ArchiveInner;
 use crate::error::TarError;
@@ -199,8 +207,12 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "async-std")]
+    /// # use async_std::{fs::File, stream::StreamExt};
     /// use async_tar_rs::Archive;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio::fs::File;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio_stream::StreamExt;
     ///
     /// # tokio_test::block_on(async {
@@ -233,8 +245,12 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "async-std")]
+    /// # use async_std::{fs::File, stream::StreamExt};
     /// use async_tar_rs::Archive;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio::fs::File;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio_stream::StreamExt;
     ///
     /// # tokio_test::block_on(async {
@@ -294,12 +310,25 @@ impl<'a, R: Read + Send> Entry<'a, R> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl<'a, R: Read + Send> Read for Entry<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let mut this = self.project();
+        Pin::new(&mut *this.fields).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "async-std")]
+impl<'a, R: Read + Send> Read for Entry<'a, R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let mut this = self.project();
         Pin::new(&mut *this.fields).poll_read(cx, buf)
     }
@@ -725,7 +754,7 @@ impl<'a> EntryFields<'a> {
             Ok(f)
         };
 
-        let f = f.map_err(|e| {
+        let mut f = f.map_err(|e| {
             let header = self.header.path_bytes();
             TarError::new(
                 format!(
@@ -737,20 +766,13 @@ impl<'a> EntryFields<'a> {
             )
         })?;
 
-        let mut f = if self.preserve_mtime {
+        if self.preserve_mtime {
             if let Some(mtime) = get_mtime(&self.header) {
-                let f = f.into_std().await;
-                filetime::set_file_handle_times(&f, Some(mtime), Some(mtime)).map_err(|e| {
+                filetime::set_file_times(&dst, mtime, mtime).map_err(|e| {
                     TarError::new(format!("failed to set mtime for `{}`", dst.display()), e)
                 })?;
-
-                fs::File::from_std(f)
-            } else {
-                f
             }
-        } else {
-            f
-        };
+        }
 
         set_perms_ownerships(
             dst,
@@ -1005,6 +1027,7 @@ impl<'a> EntryFields<'a> {
     }
 }
 
+#[cfg(feature = "tokio")]
 impl<'a> Read for EntryFields<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -1051,12 +1074,69 @@ impl<'a> Read for EntryFields<'a> {
     }
 }
 
+#[cfg(feature = "async-std")]
+impl<'a> Read for EntryFields<'a> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+        loop {
+            if this.read_state.is_none() {
+                if this.data.as_ref().is_empty() {
+                    *this.read_state = None;
+                } else {
+                    let data = &mut *this.data;
+                    *this.read_state = Some(data.remove(0));
+                }
+            }
+
+            if let Some(ref mut io) = &mut *this.read_state {
+                let ret = Pin::new(io).poll_read(cx, buf);
+                return match ret {
+                    Poll::Ready(Ok(0)) => {
+                        *this.read_state = None;
+                        if this.data.as_ref().is_empty() {
+                            return Poll::Ready(Ok(0));
+                        }
+
+                        let data = &mut *this.data;
+                        *this.read_state = Some(data.remove(0));
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                    _ => ret,
+                };
+            }
+
+            // Unable to pull another value from `data`, so we are done.
+            return Poll::Ready(Ok(0));
+        }
+    }
+}
+
+#[cfg(feature = "tokio")]
 impl<'a> Read for EntryIo<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        match self.project() {
+            EntryIoProject::Pad(io) => io.poll_read(cx, buf),
+            EntryIoProject::Data(io) => io.poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "async-std")]
+impl<'a> Read for EntryIo<'a> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         match self.project() {
             EntryIoProject::Pad(io) => io.poll_read(cx, buf),
             EntryIoProject::Data(io) => io.poll_read(cx, buf),
@@ -1099,16 +1179,35 @@ fn poll_read_all_internal<R: Read + ?Sized>(
             }
         }
 
-        let mut read_buf = io::ReadBuf::new(&mut g.buf[g.len..]);
-        match futures_core::ready!(rd.as_mut().poll_read(cx, &mut read_buf)) {
-            Ok(()) if read_buf.filled().is_empty() => {
-                ret = Poll::Ready(Ok(g.len));
-                break;
+        #[cfg(feature = "tokio")]
+        {
+            let mut read_buf = io::ReadBuf::new(&mut g.buf[g.len..]);
+            match futures_core::ready!(rd.as_mut().poll_read(cx, &mut read_buf)) {
+                Ok(()) if read_buf.filled().is_empty() => {
+                    ret = Poll::Ready(Ok(g.len));
+                    break;
+                }
+                Ok(()) => g.len += read_buf.filled().len(),
+                Err(e) => {
+                    ret = Poll::Ready(Err(e));
+                    break;
+                }
             }
-            Ok(()) => g.len += read_buf.filled().len(),
-            Err(e) => {
-                ret = Poll::Ready(Err(e));
-                break;
+        }
+
+        #[cfg(feature = "async-std")]
+        {
+            let mut read_buf = &mut g.buf[g.len..];
+            match futures_core::ready!(rd.as_mut().poll_read(cx, &mut read_buf)) {
+                Ok(0) => {
+                    ret = Poll::Ready(Ok(g.len));
+                    break;
+                }
+                Ok(n) => g.len += n,
+                Err(e) => {
+                    ret = Poll::Ready(Err(e));
+                    break;
+                }
             }
         }
     }

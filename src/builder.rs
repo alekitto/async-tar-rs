@@ -1,8 +1,17 @@
+#[cfg(feature = "async-std")]
+use async_std::{
+    fs,
+    io::{self, Read, ReadExt, Write, WriteExt},
+    stream::StreamExt,
+};
 use std::fs::Metadata;
 use std::path::Path;
 use std::str;
-use tokio::fs;
-use tokio::io::{self, AsyncRead as Read, AsyncReadExt, AsyncWrite as Write, AsyncWriteExt};
+#[cfg(feature = "tokio")]
+use tokio::{
+    fs,
+    io::{self, AsyncRead as Read, AsyncReadExt, AsyncWrite as Write, AsyncWriteExt},
+};
 
 use crate::header::{path2bytes, HeaderMode};
 use crate::{other, EntryType, Header};
@@ -326,7 +335,10 @@ impl<W: Write + Send + Unpin> Builder<W> {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "async-std")]
+    /// # use async_std::fs::File;
     /// use async_tar_rs::Builder;
+    /// # #[cfg(feature = "tokio")]
     /// use tokio::fs::File;
     ///
     /// # tokio_test::block_on(async {
@@ -504,7 +516,7 @@ async fn append_path_with_name(
             &stat,
             &mut io::empty(),
             mode,
-            Some(&link_name),
+            Some(link_name.as_ref()),
         )
         .await
     } else {
@@ -684,9 +696,20 @@ async fn append_dir_all(
         // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
         if is_dir || (is_symlink && follow && src.is_dir()) {
             let mut readdir = fs::read_dir(&src).await?;
+            #[cfg(feature = "tokio")]
             while let Some(entry) = readdir.next_entry().await? {
                 let file_type = entry.file_type().await?;
                 stack.push((entry.path(), file_type.is_dir(), file_type.is_symlink()));
+            }
+            #[cfg(feature = "async-std")]
+            while let Some(entry) = readdir.next().await {
+                let entry = entry?;
+                let file_type = entry.file_type().await?;
+                stack.push((
+                    entry.path().into(),
+                    file_type.is_dir(),
+                    file_type.is_symlink(),
+                ));
             }
             if dest != Path::new("") {
                 append_dir(dst, &dest, &src, mode).await?;
@@ -694,7 +717,15 @@ async fn append_dir_all(
         } else if !follow && is_symlink {
             let stat = fs::symlink_metadata(&src).await?;
             let link_name = fs::read_link(&src).await?;
-            append_fs(dst, &dest, &stat, &mut io::empty(), mode, Some(&link_name)).await?;
+            append_fs(
+                dst,
+                &dest,
+                &stat,
+                &mut io::empty(),
+                mode,
+                Some(link_name.as_ref()),
+            )
+            .await?;
         } else {
             #[cfg(unix)]
             {
