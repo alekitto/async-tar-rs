@@ -7,6 +7,7 @@ use filetime::FileTime;
 use pin_project::pin_project;
 use std::borrow::Cow;
 use std::cmp;
+#[cfg(unix)]
 use std::fs::Permissions;
 use std::io::{Error, ErrorKind, SeekFrom};
 use std::marker;
@@ -906,14 +907,14 @@ impl<'a> EntryFields<'a> {
             }
             match f {
                 Some(f) => {
-                    let mut perm = f.metadata()?.permissions();
+                    let mut perm = f.metadata().await?.permissions();
                     perm.set_readonly(true);
-                    f.set_permissions(perm)
+                    f.set_permissions(perm).await
                 }
                 None => {
-                    let mut perm = fs::metadata(dst)?.permissions();
+                    let mut perm = fs::metadata(dst).await?.permissions();
                     perm.set_readonly(true);
-                    fs::set_permissions(dst, perm)
+                    fs::set_permissions(dst, perm).await
                 }
             }
         }
