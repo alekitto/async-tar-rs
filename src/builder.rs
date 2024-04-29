@@ -711,7 +711,7 @@ async fn append_dir_all(
                     file_type.is_symlink(),
                 ));
             }
-            if dest != Path::new("") {
+            if dest != Path::new("") && dest != Path::new(".") {
                 append_dir(dst, &dest, &src, mode).await?;
             }
         } else if !follow && is_symlink {
