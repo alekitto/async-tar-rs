@@ -1530,7 +1530,7 @@ fn copy_path_into(mut slot: &mut [u8], path: &Path, is_link_name: bool) -> io::R
         return Err(other("paths in archives must have at least one component"));
     }
     if ends_with_slash(path) {
-        copy(&mut slot, &[b'/'])?;
+        copy(&mut slot, b"/")?;
     }
     return Ok(());
 
@@ -1555,7 +1555,7 @@ fn ends_with_slash(p: &Path) -> bool {
 
 #[cfg(unix)]
 fn ends_with_slash(p: &Path) -> bool {
-    p.as_os_str().as_bytes().ends_with(&[b'/'])
+    p.as_os_str().as_bytes().ends_with(b"/")
 }
 
 #[cfg(any(windows, target_arch = "wasm32"))]

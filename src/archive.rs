@@ -301,10 +301,8 @@ impl<'a, R: Read + Send> Stream for Entries<'a, R> {
     /// This replaces the iterator interface, and it's simpler than implementing Stream.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(
-            match futures_core::ready!(Pin::new(&mut self.fields).poll_next(cx)) {
-                Some(result) => Some(result.map(|e| EntryFields::from(e).into_entry())),
-                None => None,
-            },
+            futures_core::ready!(Pin::new(&mut self.fields).poll_next(cx))
+                .map(|result| result.map(|e| EntryFields::from(e).into_entry())),
         )
     }
 }
@@ -323,11 +321,9 @@ impl<'a> EntriesFields<'a> {
             futures_core::ready!(self.poll_skip(delta, cx))?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !futures_core::ready!(pin!(&self.archive.inner).poll_try_read_all(
-                cx,
-                header.as_mut_bytes(),
-                false
-            ))? {
+            if !futures_core::ready!(
+                pin!(&self.archive.inner).poll_try_read_all(cx, header.as_mut_bytes())
+            )? {
                 return Poll::Ready(Ok(None));
             }
 
@@ -575,11 +571,9 @@ impl<'a> EntriesFields<'a> {
                 let mut ext = GnuExtSparseHeader::new();
                 ext.isextended[0] = 1;
                 while ext.is_extended() {
-                    if !futures_core::ready!(pin!(&archive.inner).poll_try_read_all(
-                        cx,
-                        ext.as_mut_bytes(),
-                        true
-                    ))? {
+                    if !futures_core::ready!(
+                        pin!(&archive.inner).poll_try_read_all(cx, ext.as_mut_bytes())
+                    )? {
                         return Poll::Ready(Err(other("failed to read extension")));
                     }
 
@@ -780,15 +774,10 @@ impl<R: ?Sized + Read + Send + Unpin> ArchiveInner<R> {
         mut self: Pin<&mut &Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-        buffered: bool,
     ) -> Poll<io::Result<bool>> {
         let Ok(mut sbuf) = self.buf.try_lock() else {
             return Poll::Pending;
         };
-
-        if !buffered {
-            sbuf.clear();
-        }
 
         let mut t = [0; 512];
         let rem = buf.len() - sbuf.len();
@@ -798,8 +787,8 @@ impl<R: ?Sized + Read + Send + Unpin> ArchiveInner<R> {
             return Poll::Ready(Err(e));
         }
 
-        if b.filled().len() == 0 {
-            if sbuf.len() == 0 {
+        if b.filled().is_empty() {
+            if sbuf.is_empty() {
                 Poll::Ready(Ok(false))
             } else {
                 Poll::Ready(Err(other("failed to read entire block")))
@@ -829,15 +818,10 @@ impl<R: ?Sized + Read + Send + Unpin> ArchiveInner<R> {
         mut self: Pin<&mut &Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-        buffered: bool,
     ) -> Poll<io::Result<bool>> {
         let Some(mut sbuf) = self.buf.try_lock() else {
             return Poll::Pending;
         };
-
-        if !buffered {
-            sbuf.clear();
-        }
 
         let mut t = [0; 512];
         let rem = buf.len() - sbuf.len();
