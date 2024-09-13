@@ -1,0 +1,1 @@
+window.ALL_CRATES = ["async_tar_rs"];
