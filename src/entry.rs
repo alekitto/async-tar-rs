@@ -728,7 +728,7 @@ impl<'a> EntryFields<'a> {
                     } else if self.overwrite {
                         match fs::remove_file(dst).await {
                             Ok(()) => open(dst).await,
-                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst).await,
+                            Err(ref e) if e.kind() == ErrorKind::NotFound => open(dst).await,
                             Err(e) => Err(e),
                         }
                     } else {
